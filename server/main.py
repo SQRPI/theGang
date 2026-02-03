@@ -163,6 +163,8 @@ ROOMS: Dict[str, Room] = {}
 def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str, Any]:
     stage_name_map = {
         "lobby": "等待中",
+        # 兼容旧版本（曾用 drafting/showdown）
+        "drafting": "翻牌前",
         "preflop": "翻牌前",
         "flop": "翻牌",
         "turn": "转牌",
@@ -201,7 +203,8 @@ def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str,
 
 
 def _is_drafting_stage(stage: str) -> bool:
-    return stage in {"preflop", "flop", "turn", "river"}
+    # 兼容旧版本 stage="drafting"
+    return stage in {"drafting", "preflop", "flop", "turn", "river"}
 
 
 def _room_log(room: Room, text: str, round_idx: Optional[int] = None) -> None:

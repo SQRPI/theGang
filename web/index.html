@@ -209,7 +209,7 @@
         currentRid = state.rid;
         if (currentRid) ridEl.value = currentRid;
 
-        const isDraftingStage = ["preflop", "flop", "turn", "river"].includes(state.stage);
+        const isDraftingStage = ["drafting", "preflop", "flop", "turn", "river"].includes(state.stage);
         const isMyTurn = state.currentTurnPid === myPid && isDraftingStage;
 
         boardEl.innerHTML = "";
