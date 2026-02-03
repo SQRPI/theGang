@@ -161,7 +161,17 @@ ROOMS: Dict[str, Room] = {}
 
 
 def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str, Any]:
-    # 注意：只向本人展示自己的底牌
+    stage_name_map = {
+        "lobby": "等待中",
+        "preflop": "翻牌前",
+        "flop": "翻牌",
+        "turn": "转牌",
+        "river": "河牌",
+        "showdown": "亮牌",
+    }
+
+    # 注意：亮牌阶段公开所有人的底牌；其他阶段只向本人展示自己的底牌
+    reveal_all = room.stage == "showdown"
     players = []
     for p in room.players.values():
         players.append(
@@ -169,7 +179,7 @@ def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str,
                 "pid": p.pid,
                 "nickname": p.nickname,
                 "isHost": p.pid == room.host_pid,
-                "hole": [c.code() for c in p.hole] if (viewer_pid == p.pid) else [],
+                "hole": [c.code() for c in p.hole] if (reveal_all or viewer_pid == p.pid) else [],
                 "chipsByRound": dict(p.chips_by_round),
                 "joinIndex": p.join_index,
             }
@@ -180,6 +190,7 @@ def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str,
         "rid": room.rid,
         "started": room.started,
         "stage": room.stage,
+        "stageName": stage_name_map.get(room.stage, room.stage),
         "round": room.round_idx,
         "board": [c.code() for c in room.board],
         "publicChips": sorted(list(room.public_chips)),
@@ -187,6 +198,10 @@ def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str,
         "players": players,
         "logs": room.logs[-200:],
     }
+
+
+def _is_drafting_stage(stage: str) -> bool:
+    return stage in {"preflop", "flop", "turn", "river"}
 
 
 def _room_log(room: Room, text: str, round_idx: Optional[int] = None) -> None:
@@ -231,7 +246,7 @@ def _first_round_rank(room: Room) -> Dict[str, int]:
 
 
 def _next_turn(room: Room) -> None:
-    if room.stage != "drafting":
+    if not _is_drafting_stage(room.stage):
         room.current_turn_pid = None
         return
     unassigned = {p.pid for p in _unassigned_players(room, room.round_idx)}
@@ -277,6 +292,7 @@ def _deal_for_round(room: Room, round_idx: int) -> None:
 
 def _start_round(room: Room, round_idx: int) -> None:
     room.round_idx = round_idx
+    room.stage = {1: "preflop", 2: "flop", 3: "turn", 4: "river"}.get(round_idx, room.stage)
     n = _n_players(room)
     room.public_chips = set(range(1, n + 1))
     _room_log(room, f"第{round_idx}轮开始：生成公共筹码 1..{n}", round_idx=round_idx)
@@ -286,7 +302,7 @@ def _start_round(room: Room, round_idx: int) -> None:
 def _reset_for_new_game(room: Room) -> None:
     # 保留玩家与日志，重置牌局相关状态
     room.started = True
-    room.stage = "drafting"
+    room.stage = "preflop"
     room.round_idx = 0
     room.board = []
     room.public_chips = set()
@@ -446,7 +462,7 @@ async def ws_endpoint(ws: WebSocket):
                         await ws.send_text(json.dumps({"type": "error", "message": "至少需要2名玩家"}, ensure_ascii=False))
                         continue
                     room.started = True
-                    room.stage = "drafting"
+                    room.stage = "preflop"
                     room.deck = new_deck()
                     secrets.SystemRandom().shuffle(room.deck)
                     pids = list(room.players.keys())
@@ -529,7 +545,7 @@ async def ws_endpoint(ws: WebSocket):
                 from_where = msg.get("from")
                 from_pid = msg.get("fromPid")
                 async with room.lock:
-                    if room.stage != "drafting":
+                    if not _is_drafting_stage(room.stage):
                         await ws.send_text(json.dumps({"type": "error", "message": "当前不在选筹码阶段"}, ensure_ascii=False))
                         continue
                     if room.current_turn_pid != pid:

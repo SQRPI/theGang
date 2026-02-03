@@ -203,13 +203,14 @@
 
       function render() {
         if (!state) return;
-        stageEl.textContent = state.stage;
+        stageEl.textContent = state.stageName || state.stage;
         roundEl.textContent = state.round || "-";
         ridShowEl.textContent = state.rid || "-";
         currentRid = state.rid;
         if (currentRid) ridEl.value = currentRid;
 
-        const isMyTurn = state.currentTurnPid === myPid && state.stage === "drafting";
+        const isDraftingStage = ["preflop", "flop", "turn", "river"].includes(state.stage);
+        const isMyTurn = state.currentTurnPid === myPid && isDraftingStage;
 
         boardEl.innerHTML = "";
         for (const c of state.board || []) {
@@ -309,7 +310,7 @@
         const canStart = me && me.isHost && !state.started;
         btnStart.disabled = !canStart;
 
-        turnHintEl.textContent = state.stage !== "drafting"
+        turnHintEl.textContent = !isDraftingStage
           ? "未在选筹码阶段"
           : (isMyTurn ? "轮到你行动：直接点击公共筹码或点击其他玩家的本轮筹码" : `等待他人行动（当前：${state.currentTurnPid}）`);
 
