@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>纸牌帮</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, "Segoe UI", Arial, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background:#f6f7fb; color:#111; }
+      .wrap { max-width: 1100px; margin: 0 auto; padding: 18px; }
+      .grid { display:grid; grid-template-columns: 360px 1fr; gap: 14px; align-items:start; }
+      .card { background:white; border:1px solid #e6e8f0; border-radius: 12px; padding: 14px; box-shadow: 0 4px 18px rgba(20,20,40,.06); }
+      h1 { font-size: 18px; margin: 0 0 10px; }
+      h2 { font-size: 14px; margin: 0 0 10px; color:#2c2c35; }
+      .row { display:flex; gap: 8px; align-items:center; }
+      input, button, select { height: 36px; border-radius: 10px; border:1px solid #d7d9e3; padding: 0 10px; background:white; }
+      button { cursor:pointer; background:#111827; color:white; border-color:#111827; }
+      button.secondary { background:white; color:#111827; }
+      button:disabled { opacity:.5; cursor:not-allowed; }
+      .muted { color:#6b7280; font-size: 12px; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+      .chips { display:flex; flex-wrap:wrap; gap: 10px; }
+      .chip { border:1px solid #d7d9e3; padding: 8px 10px; border-radius:999px; background:#fff; }
+      .chipCircle {
+        width: 44px; height: 44px; border-radius: 999px;
+        display:flex; align-items:center; justify-content:center;
+        border: 2px solid #cfd3e3;
+        background: radial-gradient(circle at 30% 30%, #ffffff, #eef1ff);
+        box-shadow: 0 8px 18px rgba(10, 15, 40, .10);
+        font-weight: 800;
+        user-select:none;
+      }
+      .chipCircle.clickable { cursor:pointer; border-color:#111827; }
+      .chipCircle.clickable:hover { transform: translateY(-1px); }
+      .chipCircle.small { width: 30px; height: 30px; font-size: 12px; font-weight: 800; box-shadow:none; }
+      .pill { display:inline-flex; align-items:center; gap:6px; padding: 4px 10px; border-radius: 999px; border:1px solid #e6e8f0; background:#fbfbff; }
+      .players { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+      .p { border:1px solid #eceef6; border-radius: 12px; padding: 10px; background:#fcfdff; }
+      .p .name { font-weight:600; display:flex; justify-content:space-between; }
+      .p .chips { margin-top: 8px; }
+      .board { display:flex; gap: 8px; flex-wrap:wrap; }
+      .pcards { display:flex; gap: 10px; flex-wrap:wrap; }
+      .playingCard {
+        width: 54px; height: 76px;
+        border-radius: 12px;
+        border: 1px solid #d7d9e3;
+        background: linear-gradient(180deg, #ffffff, #fbfbff);
+        box-shadow: 0 10px 25px rgba(10, 15, 40, .10);
+        padding: 8px;
+        display:flex; flex-direction:column; justify-content:space-between;
+      }
+      .playingCard .r { font-weight: 900; font-size: 16px; }
+      .playingCard .s { font-size: 16px; }
+      .playingCard.red { color: #b91c1c; }
+      .playingCard.black { color: #111827; }
+      .playingCard .corner { display:flex; gap: 6px; align-items:center; }
+      .playingCard .big { font-size: 28px; line-height: 1; text-align:center; opacity: .9; }
+      .chipHistory { display:flex; gap: 8px; flex-wrap:wrap; align-items:center; }
+      .chipBadge { display:flex; align-items:center; gap:6px; border:1px dashed #d7d9e3; padding: 6px 10px; border-radius: 12px; background:#fff; }
+      .chipBadge .lbl { font-size: 11px; color:#6b7280; }
+      .logPanel { background:#0b1020; color:#d6e0ff; border-radius: 12px; padding: 10px; height: 260px; overflow:auto; }
+      .logGroup { margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid rgba(214,224,255,.12); }
+      .logGroup:last-child { border-bottom:none; padding-bottom:0; margin-bottom:0; }
+      .logGroupTitle { font-size: 12px; color:#9db1ff; margin-bottom: 6px; display:flex; gap:8px; align-items:center; }
+      .logItem { font-size: 12px; line-height: 1.5; color:#d6e0ff; opacity:.96; }
+      .logItem.muted { color:#9aa6c9; }
+      .ok { color: #0f766e; font-weight:600; }
+      .bad { color: #b91c1c; font-weight:600; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="grid">
+        <div class="card">
+          <h2>连接与房间</h2>
+          <div class="row" style="margin-bottom:8px;">
+            <input id="nickname" placeholder="昵称（必填）" style="flex:1;" maxlength="20" />
+          </div>
+          <div class="row" style="margin-bottom:8px;">
+            <button id="btnCreate">创建房间</button>
+            <input id="rid" placeholder="房间号" class="mono" style="flex:1;" />
+          </div>
+          <div class="row" style="margin-bottom:8px;">
+            <button id="btnJoin" class="secondary">加入房间</button>
+            <button id="btnStart" disabled>房主开始</button>
+          </div>
+          <div class="row" style="margin-bottom:8px;">
+            <button id="btnLeave" class="secondary" disabled>退出房间</button>
+            <button id="btnNewGame" disabled>下一局</button>
+          </div>
+          <div class="muted">
+            你的 pid：<span class="mono" id="pid">-</span><br />
+            当前房间：<span class="mono" id="ridShow">-</span>
+          </div>
+          <hr style="border:none;border-top:1px solid #eceef6;margin:14px 0;" />
+          <h2>行动</h2>
+          <div class="muted" id="turnHint">未开始</div>
+          <div style="height:8px;"></div>
+          <div class="muted">
+            轮到你时：直接点击右侧的公共筹码拿取，或点击其他玩家的“本轮筹码”进行夺取。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>游戏状态</h2>
+          <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+            <div class="pill">阶段：<span id="stage">-</span></div>
+            <div class="pill">第 <span id="round">-</span> 轮</div>
+          </div>
+
+          <div style="margin-bottom:10px;">
+            <div class="muted">公共牌</div>
+            <div class="pcards" id="board"></div>
+          </div>
+
+          <div style="margin-bottom:10px;">
+            <div class="muted">当前轮公共筹码（可被拿取）</div>
+            <div class="chips" id="publicChips"></div>
+          </div>
+
+          <div style="margin-bottom:10px;">
+            <div class="muted">玩家（点击他人的“本轮筹码”可夺取）</div>
+            <div class="players" id="players"></div>
+          </div>
+
+          <div class="muted">日志（含每轮筹码流转）</div>
+          <div class="logPanel" id="log"></div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const logEl = document.getElementById("log");
+      const pidEl = document.getElementById("pid");
+      const ridEl = document.getElementById("rid");
+      const ridShowEl = document.getElementById("ridShow");
+      const nickEl = document.getElementById("nickname");
+      const btnCreate = document.getElementById("btnCreate");
+      const btnJoin = document.getElementById("btnJoin");
+      const btnStart = document.getElementById("btnStart");
+      const btnLeave = document.getElementById("btnLeave");
+      const btnNewGame = document.getElementById("btnNewGame");
+      const stageEl = document.getElementById("stage");
+      const roundEl = document.getElementById("round");
+      const boardEl = document.getElementById("board");
+      const publicChipsEl = document.getElementById("publicChips");
+      const playersEl = document.getElementById("players");
+      const turnHintEl = document.getElementById("turnHint");
+
+      let ws;
+      let myPid = null;
+      let state = null;
+      let currentRid = null;
+      let lastLogSeq = 0;
+
+      function parseCard(code) {
+        const r = code?.[0] || "?";
+        const s = code?.[1] || "?";
+        const suitMap = { s: "♠", h: "♥", d: "♦", c: "♣" };
+        const sym = suitMap[s] || s;
+        const color = (s === "h" || s === "d") ? "red" : "black";
+        return { r, s, sym, color };
+      }
+
+      function cardEl(code) {
+        const c = parseCard(code);
+        const d = document.createElement("div");
+        d.className = `playingCard ${c.color}`;
+        d.innerHTML = `
+          <div class="corner"><span class="r">${c.r}</span><span class="s">${c.sym}</span></div>
+          <div class="big">${c.sym}</div>
+          <div class="corner" style="justify-content:flex-end;"><span class="s">${c.sym}</span><span class="r">${c.r}</span></div>
+        `;
+        return d;
+      }
+
+      function chipCircleEl(n, { clickable = false, small = false, title = "" } = {}) {
+        const d = document.createElement("div");
+        d.className = "chipCircle" + (clickable ? " clickable" : "") + (small ? " small" : "");
+        d.textContent = n;
+        if (title) d.title = title;
+        return d;
+      }
+
+      function addLogLine(s) {
+        // 兼容：连接/错误等本地提示也用日志面板展示
+        const d = document.createElement("div");
+        d.className = "logItem muted";
+        d.textContent = s;
+        logEl.appendChild(d);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function send(msg) {
+        ws.send(JSON.stringify(msg));
+      }
+
+      function render() {
+        if (!state) return;
+        stageEl.textContent = state.stage;
+        roundEl.textContent = state.round || "-";
+        ridShowEl.textContent = state.rid || "-";
+        currentRid = state.rid;
+        if (currentRid) ridEl.value = currentRid;
+
+        const isMyTurn = state.currentTurnPid === myPid && state.stage === "drafting";
+
+        boardEl.innerHTML = "";
+        for (const c of state.board || []) {
+          boardEl.appendChild(cardEl(c));
+        }
+
+        publicChipsEl.innerHTML = "";
+        for (const n of state.publicChips || []) {
+          const wrap = document.createElement("div");
+          wrap.className = "chip";
+          const c = chipCircleEl(n, { clickable: isMyTurn, title: "点击从公共区拿取" });
+          if (isMyTurn) {
+            c.onclick = () => {
+              send({ type: "pick_chip", chip: n, from: "public" });
+            };
+          }
+          wrap.appendChild(c);
+          publicChipsEl.appendChild(wrap);
+        }
+
+        playersEl.innerHTML = "";
+        for (const p of state.players || []) {
+          const d = document.createElement("div");
+          d.className = "p";
+          const isMe = p.pid === myPid;
+          const isTurn = state.currentTurnPid === p.pid;
+          const holeCodes = (p.hole || []);
+          const chips = p.chipsByRound || {};
+          const chipRounds = Object.keys(chips).sort((a,b)=>Number(a)-Number(b));
+          const currentRoundChip = chips[String(state.round)];
+          d.innerHTML = `
+            <div class="name">
+              <span>${p.nickname} ${p.isHost ? "（房主）" : ""} ${isMe ? "（你）" : ""}</span>
+              <span class="${isTurn ? "ok" : "muted"}">${isTurn ? "行动中" : ""}</span>
+            </div>
+            <div class="muted mono" style="margin-top:6px;">pid: ${p.pid}</div>
+            <div class="muted" style="margin-top:6px;">底牌（仅本人可见）</div>
+            <div class="pcards" data-hole="1" style="margin-top:6px;"></div>
+            <div class="muted" style="margin-top:6px;">历史筹码</div>
+            <div class="chipHistory" data-his="1" style="margin-top:6px;"></div>
+            <div class="row" style="margin-top:8px; justify-content:space-between;">
+              <div class="muted">本轮筹码</div>
+              <div class="row" style="gap:8px;" data-cur-chip="1"></div>
+            </div>
+          `;
+          const hisWrap = d.querySelector('[data-his="1"]');
+          if (chipRounds.length) {
+            for (const r of chipRounds) {
+              const badge = document.createElement("div");
+              badge.className = "chipBadge";
+              const lbl = document.createElement("div");
+              lbl.className = "lbl";
+              lbl.textContent = "R" + r;
+              const chipN = chips[r];
+              const cc = chipCircleEl(chipN, { small: true });
+              badge.appendChild(lbl);
+              badge.appendChild(cc);
+              hisWrap.appendChild(badge);
+            }
+          } else {
+            const tip = document.createElement("div");
+            tip.className = "muted";
+            tip.textContent = "（暂无）";
+            hisWrap.appendChild(tip);
+          }
+
+          const holeWrap = d.querySelector('[data-hole="1"]');
+          if (holeCodes.length) {
+            for (const c of holeCodes) holeWrap.appendChild(cardEl(c));
+          } else {
+            const tip = document.createElement("div");
+            tip.className = "muted";
+            tip.textContent = isMe ? "（未发牌/未开始）" : "（不可见）";
+            holeWrap.appendChild(tip);
+          }
+
+          const curChipWrap = d.querySelector('[data-cur-chip="1"]');
+          if (currentRoundChip) {
+            const c = chipCircleEl(currentRoundChip, { clickable: isMyTurn && !isMe, title: "点击夺取该玩家本轮筹码" });
+            if (isMyTurn && !isMe) {
+              c.onclick = () => {
+                send({ type: "pick_chip", chip: Number(currentRoundChip), from: "player", fromPid: p.pid });
+              };
+            }
+            curChipWrap.appendChild(c);
+          } else {
+            const tip = document.createElement("div");
+            tip.className = "muted";
+            tip.textContent = "（未拿）";
+            curChipWrap.appendChild(tip);
+          }
+
+          playersEl.appendChild(d);
+        }
+
+        const me = (state.players || []).find(p => p.pid === myPid);
+        const canStart = me && me.isHost && !state.started;
+        btnStart.disabled = !canStart;
+
+        turnHintEl.textContent = state.stage !== "drafting"
+          ? "未在选筹码阶段"
+          : (isMyTurn ? "轮到你行动：直接点击公共筹码或点击其他玩家的本轮筹码" : `等待他人行动（当前：${state.currentTurnPid}）`);
+
+        // 房间按钮状态
+        btnLeave.disabled = !state?.rid;
+        btnNewGame.disabled = !(me && me.isHost && state.stage === "showdown");
+
+        // 结构化日志：每次全量重绘（最多 200 条，开销可接受），分轮展示
+        const logs = state.logs || [];
+        const grouped = new Map();
+        for (const e of logs) {
+          const k = String(e.round ?? "-");
+          if (!grouped.has(k)) grouped.set(k, []);
+          grouped.get(k).push(e);
+        }
+        const keys = Array.from(grouped.keys()).sort((a,b) => {
+          const na = a === "-" ? -1 : Number(a);
+          const nb = b === "-" ? -1 : Number(b);
+          return na - nb;
+        });
+        logEl.innerHTML = "";
+        for (const k of keys) {
+          const g = document.createElement("div");
+          g.className = "logGroup";
+          const t = document.createElement("div");
+          t.className = "logGroupTitle";
+          t.textContent = (k === "0" || k === "-") ? "房间/系统" : ("第" + k + "轮");
+          g.appendChild(t);
+          for (const e of grouped.get(k)) {
+            const it = document.createElement("div");
+            it.className = "logItem";
+            it.textContent = "• " + (e.text || "");
+            g.appendChild(it);
+          }
+          logEl.appendChild(g);
+        }
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function connect() {
+        const proto = location.protocol === "https:" ? "wss" : "ws";
+        ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+        ws.onopen = () => addLogLine("已连接服务器");
+        ws.onclose = () => addLogLine("连接断开，刷新页面可重连");
+        ws.onerror = () => addLogLine("连接错误");
+        ws.onmessage = (ev) => {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "hello") {
+            myPid = msg.pid;
+            pidEl.textContent = myPid;
+            addLogLine("分配 pid: " + myPid);
+          } else if (msg.type === "room_state") {
+            state = msg.state;
+            render();
+          } else if (msg.type === "error") {
+            addLogLine("错误：" + msg.message);
+          } else if (msg.type === "game_over") {
+            // 结束信息由服务端日志也会写入，这里只做轻提示
+            if (msg.result?.ok) addLogLine("游戏结束：胜利");
+            else addLogLine("游戏结束：失败");
+          } else {
+            addLogLine("未知消息：" + ev.data);
+          }
+        };
+      }
+
+      btnCreate.onclick = () => {
+        const nickname = nickEl.value.trim();
+        if (!nickname) return addLogLine("请输入昵称");
+        send({ type: "create_room", nickname });
+        addLogLine("已发送：创建房间");
+      };
+      btnJoin.onclick = () => {
+        const nickname = nickEl.value.trim();
+        const rid = ridEl.value.trim();
+        if (!nickname || !rid) return addLogLine("请输入昵称与房间号");
+        send({ type: "join_room", rid, nickname });
+        addLogLine("已发送：加入房间 " + rid);
+      };
+      btnStart.onclick = () => {
+        send({ type: "start_game" });
+        addLogLine("已发送：开始游戏");
+      };
+      btnLeave.onclick = () => {
+        send({ type: "leave_room" });
+        state = null;
+        ridShowEl.textContent = "-";
+        btnLeave.disabled = true;
+        btnNewGame.disabled = true;
+        stageEl.textContent = "-";
+        roundEl.textContent = "-";
+        boardEl.innerHTML = "";
+        publicChipsEl.innerHTML = "";
+        playersEl.innerHTML = "";
+        logEl.innerHTML = "";
+        addLogLine("已发送：退出房间");
+      };
+      btnNewGame.onclick = () => {
+        send({ type: "new_game" });
+        addLogLine("已发送：下一局");
+      };
+
+      connect();
+    </script>
+  </body>
+</html>
+
