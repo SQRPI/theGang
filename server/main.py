@@ -4,6 +4,7 @@ import asyncio
 import json
 import secrets
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -12,6 +13,8 @@ from fastapi.staticfiles import StaticFiles
 
 
 app = FastAPI()
+BASE_DIR = Path(__file__).resolve().parents[1]
+WEB_DIR = BASE_DIR / "web"
 
 
 def _id(nbytes: int = 6) -> str:
@@ -356,12 +359,12 @@ def _check_showdown_win(room: Room) -> Dict[str, Any]:
 # ----------------------------
 
 
-app.mount("/static", StaticFiles(directory="web"), name="static")
+app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
 
 @app.get("/")
 async def index():
-    return FileResponse("web/index.html")
+    return FileResponse(str(WEB_DIR / "index.html"))
 
 
 # ----------------------------

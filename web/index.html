@@ -30,6 +30,11 @@
         font-weight: 800;
         user-select:none;
       }
+      /* 不同轮次的筹码配色（R1~R4） */
+      .chipCircle.r1 { border-color: #fb7185; background: radial-gradient(circle at 30% 30%, #ffffff, #ffe4e6); }
+      .chipCircle.r2 { border-color: #60a5fa; background: radial-gradient(circle at 30% 30%, #ffffff, #dbeafe); }
+      .chipCircle.r3 { border-color: #34d399; background: radial-gradient(circle at 30% 30%, #ffffff, #d1fae5); }
+      .chipCircle.r4 { border-color: #a78bfa; background: radial-gradient(circle at 30% 30%, #ffffff, #ede9fe); }
       .chipCircle.clickable { cursor:pointer; border-color:#111827; }
       .chipCircle.clickable:hover { transform: translateY(-1px); }
       .chipCircle.small { width: 30px; height: 30px; font-size: 12px; font-weight: 800; box-shadow:none; }
@@ -174,9 +179,10 @@
         return d;
       }
 
-      function chipCircleEl(n, { clickable = false, small = false, title = "" } = {}) {
+      function chipCircleEl(n, { clickable = false, small = false, title = "", round = null } = {}) {
         const d = document.createElement("div");
         d.className = "chipCircle" + (clickable ? " clickable" : "") + (small ? " small" : "");
+        if (round) d.classList.add("r" + String(round));
         d.textContent = n;
         if (title) d.title = title;
         return d;
@@ -214,7 +220,7 @@
         for (const n of state.publicChips || []) {
           const wrap = document.createElement("div");
           wrap.className = "chip";
-          const c = chipCircleEl(n, { clickable: isMyTurn, title: "点击从公共区拿取" });
+          const c = chipCircleEl(n, { clickable: isMyTurn, title: "点击从公共区拿取", round: state.round });
           if (isMyTurn) {
             c.onclick = () => {
               send({ type: "pick_chip", chip: n, from: "public" });
@@ -258,7 +264,7 @@
               lbl.className = "lbl";
               lbl.textContent = "R" + r;
               const chipN = chips[r];
-              const cc = chipCircleEl(chipN, { small: true });
+              const cc = chipCircleEl(chipN, { small: true, round: Number(r) });
               badge.appendChild(lbl);
               badge.appendChild(cc);
               hisWrap.appendChild(badge);
@@ -282,7 +288,7 @@
 
           const curChipWrap = d.querySelector('[data-cur-chip="1"]');
           if (currentRoundChip) {
-            const c = chipCircleEl(currentRoundChip, { clickable: isMyTurn && !isMe, title: "点击夺取该玩家本轮筹码" });
+            const c = chipCircleEl(currentRoundChip, { clickable: isMyTurn && !isMe, title: "点击夺取该玩家本轮筹码", round: state.round });
             if (isMyTurn && !isMe) {
               c.onclick = () => {
                 send({ type: "pick_chip", chip: Number(currentRoundChip), from: "player", fromPid: p.pid });
