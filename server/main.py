@@ -141,7 +141,7 @@ class Room:
     players: Dict[str, Player] = field(default_factory=dict)
     started: bool = False
     round_idx: int = 0  # 1..4
-    stage: str = "lobby"  # lobby|drafting|showdown
+    stage: str = "lobby"  # lobby|preflop|flop|turn|river|showdown（兼容 drafting）
 
     deck: List[Card] = field(default_factory=list)
     board: List[Card] = field(default_factory=list)
@@ -160,18 +160,20 @@ class Room:
 ROOMS: Dict[str, Room] = {}
 
 
-def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str, Any]:
-    stage_name_map = {
-        "lobby": "等待中",
-        # 兼容旧版本（曾用 drafting/showdown）
-        "drafting": "翻牌前",
-        "preflop": "翻牌前",
-        "flop": "翻牌",
-        "turn": "转牌",
-        "river": "河牌",
-        "showdown": "亮牌",
-    }
+# 阶段中文名（前后端共用）
+STAGE_NAME_MAP = {
+    "lobby": "等待中",
+    # 兼容旧版本（曾用 drafting/showdown）
+    "drafting": "翻牌前",
+    "preflop": "翻牌前",
+    "flop": "翻牌",
+    "turn": "转牌",
+    "river": "河牌",
+    "showdown": "亮牌",
+}
 
+
+def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str, Any]:
     # 注意：亮牌阶段公开所有人的底牌；其他阶段只向本人展示自己的底牌
     reveal_all = room.stage == "showdown"
     players = []
@@ -192,7 +194,7 @@ def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str,
         "rid": room.rid,
         "started": room.started,
         "stage": room.stage,
-        "stageName": stage_name_map.get(room.stage, room.stage),
+        "stageName": STAGE_NAME_MAP.get(room.stage, room.stage),
         "round": room.round_idx,
         "board": [c.code() for c in room.board],
         "publicChips": sorted(list(room.public_chips)),
@@ -209,7 +211,15 @@ def _is_drafting_stage(stage: str) -> bool:
 
 def _room_log(room: Room, text: str, round_idx: Optional[int] = None) -> None:
     room.log_seq += 1
-    room.logs.append({"seq": room.log_seq, "round": round_idx if round_idx is not None else room.round_idx, "text": text})
+    room.logs.append(
+        {
+            "seq": room.log_seq,
+            "round": round_idx if round_idx is not None else room.round_idx,
+            "stage": room.stage,
+            "stageName": STAGE_NAME_MAP.get(room.stage, room.stage),
+            "text": text,
+        }
+    )
 
 
 async def room_broadcast(room: Room, msg: Dict[str, Any]) -> None:
@@ -393,6 +403,7 @@ async def index():
 # - {"type":"create_room","nickname":"xx"}
 # - {"type":"join_room","rid":"...","nickname":"xx"}
 # - {"type":"start_game"}
+# - {"type":"new_game"}
 # - {"type":"pick_chip","chip":number,"from":"public"|"player","fromPid":optional}
 #
 # server -> client:
@@ -405,15 +416,84 @@ async def index():
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    pid = _id()
-    await ws.send_text(json.dumps({"type": "hello", "pid": pid}, ensure_ascii=False))
+
+    # ----------------------------
+    # 断线重连 / 刷新恢复：
+    # - 客户端可在 ws url 上带 query 参数：?rid=xxx&pid=yyy
+    # - 若该 pid 已存在于房间中，则直接把此 ws 重新绑定到该玩家
+    # ----------------------------
+    qp = ws.query_params
+    resume_rid = (qp.get("rid") or "").strip()
+    resume_pid = (qp.get("pid") or "").strip()
 
     current_room: Optional[Room] = None
+    pid: str
+
+    if resume_rid and resume_pid:
+        room = ROOMS.get(resume_rid)
+        if room and resume_pid in room.players:
+            async with room.lock:
+                p = room.players[resume_pid]
+                p.ws = ws
+                current_room = room
+                pid = resume_pid
+                _room_log(room, f"玩家重连：{p.nickname}", round_idx=0)
+                await ws.send_text(json.dumps({"type": "hello", "pid": pid, "resumed": True}, ensure_ascii=False))
+                # 该玩家视角状态（含自己的底牌）
+                await ws.send_text(
+                    json.dumps({"type": "room_state", "state": room_public_state(room, pid), "forPid": pid}, ensure_ascii=False)
+                )
+            # 其他人也刷新一下状态（可选）
+            try:
+                await room_broadcast(room, {"type": "room_state", "state": room_public_state(room, None)})
+            except Exception:
+                pass
+        else:
+            pid = _id()
+            await ws.send_text(json.dumps({"type": "hello", "pid": pid}, ensure_ascii=False))
+    else:
+        pid = _id()
+        await ws.send_text(json.dumps({"type": "hello", "pid": pid}, ensure_ascii=False))
     try:
         while True:
             raw = await ws.receive_text()
-            msg = json.loads(raw)
-            mtype = msg.get("type")
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                await ws.send_text(json.dumps({"type": "error", "message": "消息不是合法 JSON"}, ensure_ascii=False))
+                continue
+
+            if not isinstance(msg, dict):
+                await ws.send_text(json.dumps({"type": "error", "message": "消息格式应为 JSON 对象"}, ensure_ascii=False))
+                continue
+
+            raw_mtype = msg.get("type")
+            mtype: Any = raw_mtype
+            # 兼容：不同客户端可能的写法差异（大小写/空格/连字符/别名）
+            if isinstance(mtype, str):
+                norm = mtype.strip().lower().replace("-", "_")
+                norm = "_".join(norm.split())  # 把多余空白折叠为下划线
+                alias_to_new_game = {
+                    "newgame",
+                    "new_game",
+                    "nextgame",
+                    "next_game",
+                    "next_round",
+                    "nextround",
+                    "restart",
+                    "replay",
+                }
+                if norm in alias_to_new_game:
+                    mtype = "new_game"
+                else:
+                    mtype = norm
+            else:
+                # 有些客户端可能用 action/cmd/op 来表示消息类型
+                for k in ("action", "cmd", "op"):
+                    v = msg.get(k)
+                    if isinstance(v, str) and v.strip():
+                        mtype = v.strip().lower().replace("-", "_")
+                        break
 
             if mtype == "create_room":
                 nickname = (msg.get("nickname") or "").strip()[:20]
@@ -636,7 +716,25 @@ async def ws_endpoint(ws: WebSocket):
                                 )
 
             else:
-                await ws.send_text(json.dumps({"type": "error", "message": "未知消息类型"}, ensure_ascii=False))
+                # 把未知消息写到房间日志，便于排查“下一局触发未知消息类型”
+                if current_room is not None:
+                    try:
+                        _room_log(
+                            current_room,
+                            f"收到未知消息：type={repr(raw_mtype)[:120]} norm={repr(mtype)[:120]} raw={raw[:260]}",
+                            round_idx=0,
+                        )
+                    except Exception:
+                        pass
+                await ws.send_text(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "message": f"未知消息类型：{repr(raw_mtype)[:120]}（归一化后：{repr(mtype)[:120]}）",
+                        },
+                        ensure_ascii=False,
+                    )
+                )
 
     except WebSocketDisconnect:
         # 断线：保留玩家在房间中，但 ws 置空（便于重连扩展）

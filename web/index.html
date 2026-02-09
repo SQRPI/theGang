@@ -71,6 +71,30 @@
       .logItem.muted { color:#9aa6c9; }
       .ok { color: #0f766e; font-weight:600; }
       .bad { color: #b91c1c; font-weight:600; }
+
+      /* ----------------------------
+         响应式：手机小屏适配
+         - 小屏时改为单列，让“连接与房间”在最上面
+         ---------------------------- */
+      @media (max-width: 900px) {
+        .wrap { padding: 12px; }
+        .grid { grid-template-columns: 1fr; }
+        /* 确保左侧“连接与房间”卡片在上面 */
+        .grid > .card:first-child { order: 0; }
+        .grid > .card:last-child { order: 1; }
+
+        .row { flex-wrap: wrap; }
+        input, button, select { width: 100%; }
+        .logPanel { height: 220px; }
+      }
+
+      @media (max-width: 520px) {
+        .players { grid-template-columns: 1fr; }
+        .grid { gap: 10px; }
+        .card { padding: 12px; }
+        .playingCard { width: 50px; height: 72px; }
+        .chipCircle { width: 40px; height: 40px; }
+      }
     </style>
   </head>
   <body>
@@ -158,6 +182,25 @@
       let currentRid = null;
       let lastLogSeq = 0;
 
+      // 断线重连：指数退避
+      let reconnectTimer = null;
+      let reconnectAttempt = 0;
+      let manuallyClosed = false;
+
+      const LS_PID = "theGang_pid";
+      const LS_RID = "theGang_rid";
+      const LS_NICK = "theGang_nickname";
+      const stageNameMap = {
+        lobby: "等待中",
+        drafting: "翻牌前",
+        preflop: "翻牌前",
+        flop: "翻牌",
+        turn: "转牌",
+        river: "河牌",
+        showdown: "亮牌",
+      };
+      const stageOrder = ["lobby", "preflop", "flop", "turn", "river", "showdown"];
+
       function parseCard(code) {
         const r = code?.[0] || "?";
         const s = code?.[1] || "?";
@@ -198,6 +241,10 @@
       }
 
       function send(msg) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          addLogLine("未连接服务器，发送失败：" + (msg?.type || "unknown"));
+          return;
+        }
         ws.send(JSON.stringify(msg));
       }
 
@@ -208,6 +255,7 @@
         ridShowEl.textContent = state.rid || "-";
         currentRid = state.rid;
         if (currentRid) ridEl.value = currentRid;
+        if (currentRid) localStorage.setItem(LS_RID, currentRid);
 
         const isDraftingStage = ["drafting", "preflop", "flop", "turn", "river"].includes(state.stage);
         const isMyTurn = state.currentTurnPid === myPid && isDraftingStage;
@@ -311,25 +359,36 @@
         btnStart.disabled = !canStart;
 
         turnHintEl.textContent = !isDraftingStage
-          ? "未在选筹码阶段"
+          ? (state.stage === "showdown"
+              ? "亮牌阶段：牌局已结束，房主可点击「下一局」开始新一局"
+              : (state.started ? "未在选筹码阶段" : "等待房主开始游戏"))
           : (isMyTurn ? "轮到你行动：直接点击公共筹码或点击其他玩家的本轮筹码" : `等待他人行动（当前：${state.currentTurnPid}）`);
 
         // 房间按钮状态
         btnLeave.disabled = !state?.rid;
         btnNewGame.disabled = !(me && me.isHost && state.stage === "showdown");
 
-        // 结构化日志：每次全量重绘（最多 200 条，开销可接受），分轮展示
+        // 结构化日志：每次全量重绘（最多 200 条，开销可接受），按阶段展示（翻牌前/翻牌/转牌/河牌/亮牌）
         const logs = state.logs || [];
-        const grouped = new Map();
+        const grouped = new Map(); // key: stageId
         for (const e of logs) {
-          const k = String(e.round ?? "-");
-          if (!grouped.has(k)) grouped.set(k, []);
-          grouped.get(k).push(e);
+          // 新版服务端会附带 stage/stageName；旧日志则尝试用 round 推断
+          let stageId = e.stage;
+          if (!stageId) {
+            const r = Number(e.round);
+            stageId = (r === 1) ? "preflop"
+              : (r === 2) ? "flop"
+              : (r === 3) ? "turn"
+              : (r === 4) ? "river"
+              : "lobby";
+          }
+          if (!grouped.has(stageId)) grouped.set(stageId, []);
+          grouped.get(stageId).push(e);
         }
-        const keys = Array.from(grouped.keys()).sort((a,b) => {
-          const na = a === "-" ? -1 : Number(a);
-          const nb = b === "-" ? -1 : Number(b);
-          return na - nb;
+        const keys = Array.from(grouped.keys()).sort((a, b) => {
+          const ia = stageOrder.indexOf(a);
+          const ib = stageOrder.indexOf(b);
+          return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
         });
         logEl.innerHTML = "";
         for (const k of keys) {
@@ -337,12 +396,16 @@
           g.className = "logGroup";
           const t = document.createElement("div");
           t.className = "logGroupTitle";
-          t.textContent = (k === "0" || k === "-") ? "房间/系统" : ("第" + k + "轮");
+          const stageName = stageNameMap[k] || k;
+          t.textContent = (k === "lobby") ? "房间/系统" : stageName;
           g.appendChild(t);
-          for (const e of grouped.get(k)) {
+          const items = grouped.get(k) || [];
+          items.sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0));
+          for (const e of items) {
             const it = document.createElement("div");
             it.className = "logItem";
-            it.textContent = "• " + (e.text || "");
+            const r = (e.round === 0 || e.round === "-" || e.round == null) ? "" : (`R${e.round} `);
+            it.textContent = "• " + r + (e.text || "");
             g.appendChild(it);
           }
           logEl.appendChild(g);
@@ -351,17 +414,67 @@
       }
 
       function connect() {
-        const proto = location.protocol === "https:" ? "wss" : "ws";
-        ws = new WebSocket(`${proto}://${location.host}/ws`);
+        // 支持通过 URL 参数指定后端 WS 地址，避免每次重新部署前端
+        // 用法： https://xxx.vercel.app/?ws=wss://your-domain/ws
+        // 也支持传 https://... 会自动转换成 wss://...
+        const params = new URLSearchParams(location.search);
+        const paramWs = (params.get("ws") || "").trim();
+        let wsUrl = paramWs || (localStorage.getItem("WS_URL") || "");
+        if (paramWs) localStorage.setItem("WS_URL", paramWs);
 
-        ws.onopen = () => addLogLine("已连接服务器");
-        ws.onclose = () => addLogLine("连接断开，刷新页面可重连");
+        if (wsUrl) {
+          if (wsUrl.startsWith("https://")) wsUrl = "wss://" + wsUrl.slice("https://".length);
+          if (wsUrl.startsWith("http://")) wsUrl = "ws://" + wsUrl.slice("http://".length);
+        } else {
+          const proto = location.protocol === "https:" ? "wss" : "ws";
+          wsUrl = `${proto}://${location.host}/ws`;
+        }
+
+        // 尝试断线重连/刷新恢复：在 ws url 上带 rid + pid
+        let finalWsUrl = wsUrl;
+        try {
+          const u = new URL(wsUrl, location.href);
+          const savedRid = (localStorage.getItem(LS_RID) || "").trim();
+          const savedPid = (localStorage.getItem(LS_PID) || "").trim();
+          if (savedRid) u.searchParams.set("rid", savedRid);
+          if (savedPid) u.searchParams.set("pid", savedPid);
+          finalWsUrl = u.toString();
+        } catch (e) {
+          // URL 解析失败就退回原样
+        }
+
+        ws = new WebSocket(finalWsUrl);
+        addLogLine("WS 连接：" + wsUrl);
+
+        ws.onopen = () => {
+          addLogLine("已连接服务器");
+          reconnectAttempt = 0;
+          if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+          }
+
+          // 若没有 pid（无法 resume），但有 rid + nickname，则尝试自动加入（仅适用于尚未开始的房间）
+          const savedPid = (localStorage.getItem(LS_PID) || "").trim();
+          const savedRid = (localStorage.getItem(LS_RID) || "").trim();
+          const savedNick = (localStorage.getItem(LS_NICK) || "").trim();
+          if (!savedPid && savedRid && savedNick) {
+            send({ type: "join_room", rid: savedRid, nickname: savedNick });
+            addLogLine("自动加入房间：" + savedRid);
+          }
+        };
+        ws.onclose = () => {
+          addLogLine("连接断开，尝试重连中…");
+          if (manuallyClosed) return;
+          scheduleReconnect();
+        };
         ws.onerror = () => addLogLine("连接错误");
         ws.onmessage = (ev) => {
           const msg = JSON.parse(ev.data);
           if (msg.type === "hello") {
             myPid = msg.pid;
             pidEl.textContent = myPid;
+            if (myPid) localStorage.setItem(LS_PID, myPid);
             addLogLine("分配 pid: " + myPid);
           } else if (msg.type === "room_state") {
             state = msg.state;
@@ -378,9 +491,22 @@
         };
       }
 
+      function scheduleReconnect() {
+        if (reconnectTimer) return;
+        const base = 500; // ms
+        const max = 8000; // ms
+        const delay = Math.min(max, base * Math.pow(2, reconnectAttempt));
+        reconnectAttempt += 1;
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          connect();
+        }, delay);
+      }
+
       btnCreate.onclick = () => {
         const nickname = nickEl.value.trim();
         if (!nickname) return addLogLine("请输入昵称");
+        localStorage.setItem(LS_NICK, nickname);
         send({ type: "create_room", nickname });
         addLogLine("已发送：创建房间");
       };
@@ -388,6 +514,8 @@
         const nickname = nickEl.value.trim();
         const rid = ridEl.value.trim();
         if (!nickname || !rid) return addLogLine("请输入昵称与房间号");
+        localStorage.setItem(LS_NICK, nickname);
+        localStorage.setItem(LS_RID, rid);
         send({ type: "join_room", rid, nickname });
         addLogLine("已发送：加入房间 " + rid);
       };
@@ -408,11 +536,20 @@
         playersEl.innerHTML = "";
         logEl.innerHTML = "";
         addLogLine("已发送：退出房间");
+        localStorage.removeItem(LS_RID);
       };
       btnNewGame.onclick = () => {
         send({ type: "new_game" });
         addLogLine("已发送：下一局");
       };
+
+      // 刷新后自动填充上次昵称/房间号
+      try {
+        const savedNick = (localStorage.getItem(LS_NICK) || "").trim();
+        const savedRid = (localStorage.getItem(LS_RID) || "").trim();
+        if (savedNick && !nickEl.value) nickEl.value = savedNick;
+        if (savedRid && !ridEl.value) ridEl.value = savedRid;
+      } catch (e) {}
 
       connect();
     </script>
