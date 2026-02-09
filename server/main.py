@@ -142,6 +142,8 @@ class Room:
     host_pid: str
     players: Dict[str, Player] = field(default_factory=dict)
     started: bool = False
+    # 牌局编号（同一房间可进行多局）。用于隔离日志，避免新一局仍下发旧局日志。
+    hand_no: int = 0
     round_idx: int = 0  # 1..4
     stage: str = "lobby"  # lobby|preflop|flop|turn|river|showdown（兼容 drafting）
 
@@ -192,6 +194,10 @@ def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str,
         )
     players.sort(key=lambda x: x["joinIndex"])
 
+    # 只下发“系统/房间日志(handNo=0)”与“当前牌局日志(handNo=room.hand_no)”
+    # 兼容旧内存数据：缺失 handNo 的日志按 0 处理
+    filtered_logs = [e for e in room.logs if e.get("handNo", 0) in (0, room.hand_no)]
+
     return {
         "rid": room.rid,
         "started": room.started,
@@ -202,7 +208,7 @@ def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str,
         "publicChips": sorted(list(room.public_chips)),
         "currentTurnPid": room.current_turn_pid,
         "players": players,
-        "logs": room.logs[-200:],
+        "logs": filtered_logs[-200:],
     }
 
 
@@ -216,6 +222,7 @@ def _room_log(room: Room, text: str, round_idx: Optional[int] = None) -> None:
     room.logs.append(
         {
             "seq": room.log_seq,
+            "handNo": room.hand_no,
             "round": round_idx if round_idx is not None else room.round_idx,
             "stage": room.stage,
             "stageName": STAGE_NAME_MAP.get(room.stage, room.stage),
@@ -336,6 +343,7 @@ def _start_round(room: Room, round_idx: int) -> None:
 def _reset_for_new_game(room: Room) -> None:
     # 保留玩家与日志，重置牌局相关状态
     room.started = True
+    room.hand_no += 1
     room.stage = "preflop"
     room.round_idx = 0
     room.board = []
@@ -612,6 +620,8 @@ async def ws_endpoint(ws: WebSocket):
                         await ws.send_text(json.dumps({"type": "error", "message": "至少需要2名玩家"}, ensure_ascii=False))
                         continue
                     room.started = True
+                    # 第一次开局：从 1 开始计数
+                    room.hand_no = max(room.hand_no, 0) + 1
                     room.stage = "preflop"
                     room.deck = new_deck()
                     secrets.SystemRandom().shuffle(room.deck)
