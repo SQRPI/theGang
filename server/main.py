@@ -129,7 +129,9 @@ class Player:
     pid: str
     nickname: str
     join_index: int
-    ws: Optional[WebSocket] = None
+    # 同一玩家可能在同一台电脑打开多个页面（多个 WebSocket 连接共享同一个 pid）
+    # 不能用单个 ws，否则后连接会覆盖前连接，导致“只有一个页面收得到消息”
+    wss: Set[WebSocket] = field(default_factory=set, repr=False)
     hole: List[Card] = field(default_factory=list)
     chips_by_round: Dict[int, int] = field(default_factory=dict)  # round -> chip number
 
@@ -223,16 +225,35 @@ def _room_log(room: Room, text: str, round_idx: Optional[int] = None) -> None:
 
 
 async def room_broadcast(room: Room, msg: Dict[str, Any]) -> None:
-    dead: List[str] = []
+    """
+    向房间所有连接广播同一条消息（不区分视角）。
+    主要用于 game_over 这类所有人都相同的消息。
+    """
+    payload = json.dumps(msg, ensure_ascii=False)
+    for p in room.players.values():
+        for ws in list(p.wss):
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                p.wss.discard(ws)
+
+
+async def room_broadcast_state(room: Room) -> None:
+    """
+    向房间内每个玩家的所有连接下发“该玩家视角”的 room_state。
+
+    重要：前端会直接用最新一条 room_state 覆盖本地 state，
+    如果服务端广播过 viewer_pid=None 的“公共视角状态”，会把自己的底牌清空覆盖掉，
+    导致“断线重连后手牌不显示”的问题（私有状态先来、公共状态后到的竞态）。
+    """
     for pid, p in room.players.items():
-        if p.ws is None:
-            continue
-        try:
-            await p.ws.send_text(json.dumps(msg, ensure_ascii=False))
-        except Exception:
-            dead.append(pid)
-    for pid in dead:
-        room.players[pid].ws = None
+        msg = {"type": "room_state", "state": room_public_state(room, pid), "forPid": pid}
+        payload = json.dumps(msg, ensure_ascii=False)
+        for ws in list(p.wss):
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                p.wss.discard(ws)
 
 
 def _ensure_room(rid: str) -> Room:
@@ -469,20 +490,13 @@ async def ws_endpoint(ws: WebSocket):
         if room and resume_pid in room.players:
             async with room.lock:
                 p = room.players[resume_pid]
-                p.ws = ws
+                p.wss.add(ws)
                 current_room = room
                 pid = resume_pid
                 _room_log(room, f"玩家重连：{p.nickname}", round_idx=0)
                 await ws.send_text(json.dumps({"type": "hello", "pid": pid, "resumed": True}, ensure_ascii=False))
-                # 该玩家视角状态（含自己的底牌）
-                await ws.send_text(
-                    json.dumps({"type": "room_state", "state": room_public_state(room, pid), "forPid": pid}, ensure_ascii=False)
-                )
-            # 其他人也刷新一下状态（可选）
-            try:
-                await room_broadcast(room, {"type": "room_state", "state": room_public_state(room, None)})
-            except Exception:
-                pass
+                # 对所有玩家下发各自视角的状态，避免公共状态覆盖私有手牌
+                await room_broadcast_state(room)
         else:
             pid = _id()
             await ws.send_text(json.dumps({"type": "hello", "pid": pid}, ensure_ascii=False))
@@ -501,6 +515,20 @@ async def ws_endpoint(ws: WebSocket):
             if not isinstance(msg, dict):
                 await ws.send_text(json.dumps({"type": "error", "message": "消息格式应为 JSON 对象"}, ensure_ascii=False))
                 continue
+
+            # 若该连接曾经加入过房间，但玩家已不在房间（例如同 pid 的其它页面点了退出），
+            # 则清空 current_room，避免后续处理时访问 room.players[pid] 抛异常。
+            if current_room is not None and pid not in current_room.players:
+                try:
+                    await ws.send_text(
+                        json.dumps(
+                            {"type": "left_room", "rid": current_room.rid, "message": "你已不在该房间，请重新加入"},
+                            ensure_ascii=False,
+                        )
+                    )
+                except Exception:
+                    pass
+                current_room = None
 
             raw_mtype = msg.get("type")
             mtype: Any = raw_mtype
@@ -538,11 +566,13 @@ async def ws_endpoint(ws: WebSocket):
                 rid = _id(5)
                 room = Room(rid=rid, host_pid=pid)
                 room.join_counter += 1
-                room.players[pid] = Player(pid=pid, nickname=nickname, join_index=room.join_counter, ws=ws)
+                player = Player(pid=pid, nickname=nickname, join_index=room.join_counter)
+                player.wss.add(ws)
+                room.players[pid] = player
                 _room_log(room, f"创建房间：{nickname}（房主）进入房间", round_idx=0)
                 ROOMS[rid] = room
                 current_room = room
-                await room_broadcast(room, {"type": "room_state", "state": room_public_state(room, pid), "forPid": pid})
+                await room_broadcast_state(room)
 
             elif mtype == "join_room":
                 rid = (msg.get("rid") or "").strip()
@@ -560,10 +590,12 @@ async def ws_endpoint(ws: WebSocket):
                         await ws.send_text(json.dumps({"type": "error", "message": "游戏已开始，暂不支持中途加入"}, ensure_ascii=False))
                         continue
                     room.join_counter += 1
-                    room.players[pid] = Player(pid=pid, nickname=nickname, join_index=room.join_counter, ws=ws)
+                    player = Player(pid=pid, nickname=nickname, join_index=room.join_counter)
+                    player.wss.add(ws)
+                    room.players[pid] = player
                     _room_log(room, f"玩家加入：{nickname} 进入房间", round_idx=0)
                     current_room = room
-                    await room_broadcast(room, {"type": "room_state", "state": room_public_state(room, pid), "forPid": pid})
+                    await room_broadcast_state(room)
 
             elif mtype == "start_game":
                 if current_room is None:
@@ -591,13 +623,7 @@ async def ws_endpoint(ws: WebSocket):
                     # 第1轮发底牌并生成筹码
                     _deal_for_round(room, 1)
                     _start_round(room, 1)
-                    await room_broadcast(room, {"type": "room_state", "state": room_public_state(room, None)})
-                    # 分别给每个玩家发“私有视角状态”（含自己底牌）
-                    for p in room.players.values():
-                        if p.ws:
-                            await p.ws.send_text(
-                                json.dumps({"type": "room_state", "state": room_public_state(room, p.pid), "forPid": p.pid}, ensure_ascii=False)
-                            )
+                    await room_broadcast_state(room)
 
             elif mtype == "new_game":
                 if current_room is None:
@@ -613,12 +639,7 @@ async def ws_endpoint(ws: WebSocket):
                         continue
                     # 允许在结束后或中途直接重开（方便调试）
                     _reset_for_new_game(room)
-                    await room_broadcast(room, {"type": "room_state", "state": room_public_state(room, None)})
-                    for p in room.players.values():
-                        if p.ws:
-                            await p.ws.send_text(
-                                json.dumps({"type": "room_state", "state": room_public_state(room, p.pid), "forPid": p.pid}, ensure_ascii=False)
-                            )
+                    await room_broadcast_state(room)
 
             elif mtype == "leave_room":
                 if current_room is None:
@@ -630,6 +651,7 @@ async def ws_endpoint(ws: WebSocket):
                         current_room = None
                         continue
                     leaver = room.players[pid]
+                    leaver_wss = list(leaver.wss)
                     # 从房间移除
                     room.players.pop(pid, None)
                     _room_log(room, f"玩家退出：{leaver.nickname}", round_idx=0)
@@ -645,12 +667,14 @@ async def ws_endpoint(ws: WebSocket):
                     else:
                         # 若游戏中，可能影响筹码与回合：直接重算当前行动者
                         _next_turn(room)
-                        await room_broadcast(room, {"type": "room_state", "state": room_public_state(room, None)})
-                        for p in room.players.values():
-                            if p.ws:
-                                await p.ws.send_text(
-                                    json.dumps({"type": "room_state", "state": room_public_state(room, p.pid), "forPid": p.pid}, ensure_ascii=False)
-                                )
+                        await room_broadcast_state(room)
+
+                # 同 pid 可能有多个页面：都通知“已退出房间”，让前端同步清空 UI
+                for w in leaver_wss:
+                    try:
+                        await w.send_text(json.dumps({"type": "left_room", "rid": room.rid}, ensure_ascii=False))
+                    except Exception:
+                        pass
 
                 current_room = None
 
@@ -723,32 +747,16 @@ async def ws_endpoint(ws: WebSocket):
                                 _room_log(room, "游戏结束：排列正确，胜利！", round_idx=4)
                             else:
                                 _room_log(room, f"游戏结束：失败（{result.get('reason')}）", round_idx=4)
-                            await room_broadcast(room, {"type": "room_state", "state": room_public_state(room, None)})
+                            await room_broadcast_state(room)
                             await room_broadcast(room, {"type": "game_over", "result": result})
                         else:
                             # 下一轮：先翻牌/转牌/河牌，再生成筹码
                             _deal_for_round(room, room.round_idx + 1)
                             _start_round(room, room.round_idx + 1)
-                            await room_broadcast(room, {"type": "room_state", "state": room_public_state(room, None)})
-                            for p in room.players.values():
-                                if p.ws:
-                                    await p.ws.send_text(
-                                        json.dumps(
-                                            {"type": "room_state", "state": room_public_state(room, p.pid), "forPid": p.pid},
-                                            ensure_ascii=False,
-                                        )
-                                    )
+                            await room_broadcast_state(room)
                     else:
                         _next_turn(room)
-                        await room_broadcast(room, {"type": "room_state", "state": room_public_state(room, None)})
-                        for p in room.players.values():
-                            if p.ws:
-                                await p.ws.send_text(
-                                    json.dumps(
-                                        {"type": "room_state", "state": room_public_state(room, p.pid), "forPid": p.pid},
-                                        ensure_ascii=False,
-                                    )
-                                )
+                        await room_broadcast_state(room)
 
             else:
                 # 把未知消息写到房间日志，便于排查“下一局触发未知消息类型”
@@ -772,9 +780,9 @@ async def ws_endpoint(ws: WebSocket):
                 )
 
     except WebSocketDisconnect:
-        # 断线：保留玩家在房间中，但 ws 置空（便于重连扩展）
+        # 断线：保留玩家在房间中，但移除该 ws（同 pid 可能还有其它连接仍在线）
         if current_room is not None and pid in current_room.players:
-            current_room.players[pid].ws = None
+            current_room.players[pid].wss.discard(ws)
     except Exception as e:
         try:
             await ws.send_text(json.dumps({"type": "error", "message": f"服务器异常：{e}"}, ensure_ascii=False))

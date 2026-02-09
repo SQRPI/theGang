@@ -477,8 +477,24 @@
             if (myPid) localStorage.setItem(LS_PID, myPid);
             addLogLine("分配 pid: " + myPid);
           } else if (msg.type === "room_state") {
+            // 防御：服务端可能携带 forPid，确保不会误用别人的私有视角状态
+            if (msg.forPid && myPid && msg.forPid !== myPid) return;
             state = msg.state;
             render();
+          } else if (msg.type === "left_room") {
+            // 同一 pid 可能在多个页面：任意页面点“退出房间”后，服务端会通知所有连接同步清空
+            state = null;
+            ridShowEl.textContent = "-";
+            btnLeave.disabled = true;
+            btnNewGame.disabled = true;
+            stageEl.textContent = "-";
+            roundEl.textContent = "-";
+            boardEl.innerHTML = "";
+            publicChipsEl.innerHTML = "";
+            playersEl.innerHTML = "";
+            logEl.innerHTML = "";
+            addLogLine("已退出房间" + (msg.rid ? ("：" + msg.rid) : ""));
+            localStorage.removeItem(LS_RID);
           } else if (msg.type === "error") {
             addLogLine("错误：" + msg.message);
           } else if (msg.type === "game_over") {
