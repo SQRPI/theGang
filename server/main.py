@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 
@@ -393,7 +393,42 @@ app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
 @app.get("/")
 async def index():
-    return FileResponse(str(WEB_DIR / "index.html"))
+    # Render 上若工作目录/打包异常导致 web/ 丢失，这里返回可读的诊断页，避免只看到 Not Found
+    path = WEB_DIR / "index.html"
+    if path.exists():
+        return FileResponse(str(path))
+    try:
+        entries = [p.name for p in WEB_DIR.iterdir()]
+    except Exception as e:
+        entries = [f"<无法读取 WEB_DIR：{e}>"]
+    return HTMLResponse(
+        f"""
+<!doctype html>
+<meta charset="utf-8" />
+<title>纸牌帮</title>
+<h2>部署诊断：未找到 web/index.html</h2>
+<p>WEB_DIR: <code>{WEB_DIR}</code></p>
+<p>目录内容: <code>{entries}</code></p>
+<p>请打开 <code>/docs</code> 或 <code>/debug</code> 查看更多信息。</p>
+""",
+        status_code=500,
+    )
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+
+@app.get("/debug")
+async def debug():
+    path = WEB_DIR / "index.html"
+    return {
+        "baseDir": str(BASE_DIR),
+        "webDir": str(WEB_DIR),
+        "indexExists": path.exists(),
+        "webEntries": [p.name for p in WEB_DIR.iterdir()] if WEB_DIR.exists() else [],
+    }
 
 
 # ----------------------------
