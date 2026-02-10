@@ -4,6 +4,8 @@ import asyncio
 import json
 import secrets
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -15,6 +17,52 @@ from fastapi.staticfiles import StaticFiles
 app = FastAPI()
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIR = BASE_DIR / "web"
+DATA_DIR = BASE_DIR / "data"
+HISTORY_FILE = DATA_DIR / "history.jsonl"
+HISTORY_MAX = 5000
+HISTORY: List[Dict[str, Any]] = []
+HISTORY_LOCK = asyncio.Lock()
+
+
+def _load_history() -> None:
+    try:
+        if not HISTORY_FILE.exists():
+            return
+        # jsonl: 一行一条记录
+        for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                HISTORY.append(json.loads(s))
+            except Exception:
+                continue
+        if len(HISTORY) > HISTORY_MAX:
+            del HISTORY[: len(HISTORY) - HISTORY_MAX]
+    except Exception:
+        # 历史读取失败不影响服务启动
+        return
+
+
+def _write_history_line(record: Dict[str, Any]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with HISTORY_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+async def append_history(record: Dict[str, Any]) -> None:
+    async with HISTORY_LOCK:
+        HISTORY.append(record)
+        if len(HISTORY) > HISTORY_MAX:
+            del HISTORY[: len(HISTORY) - HISTORY_MAX]
+    # 文件写入放到线程，避免阻塞事件循环
+    try:
+        await asyncio.to_thread(_write_history_line, record)
+    except Exception:
+        pass
+
+
+_load_history()
 
 
 def _id(nbytes: int = 6) -> str:
@@ -119,6 +167,59 @@ def eval_7(cards: List[Card]) -> Tuple[int, List[int]]:
     return best
 
 
+HAND_CATEGORY_NAME = {
+    8: "同花顺",
+    7: "四条",
+    6: "葫芦",
+    5: "同花",
+    4: "顺子",
+    3: "三条",
+    2: "两对",
+    1: "一对",
+    0: "高牌",
+}
+
+
+def best_hand_any(cards: List[Card]) -> Tuple[Tuple[int, List[int]], List[Card]]:
+    """
+    德州（Hold'em）规则：可从“手牌+公共牌”中任取 5 张组成最终牌型。
+    cards: 已知的全部牌（>=5）
+    return: (score_tuple, best_five_cards)
+    """
+    if len(cards) < 5:
+        raise ValueError("cards_not_enough")
+    best_score: Tuple[int, List[int]] = (-1, [])
+    best_five: List[Card] = []
+    for five in combinations(cards, 5):
+        score = eval_5(list(five))
+        if score > best_score:
+            best_score = score
+            best_five = list(five)
+    return best_score, best_five
+
+
+def best_hand_omaha(hole: List[Card], board: List[Card]) -> Tuple[Tuple[int, List[int]], List[Card]]:
+    """
+    奥马哈规则：最终 5 张中必须“2 张来自手牌 + 3 张来自公共牌”。
+    hole 可为 3~6（或 4 张经典奥马哈），board >= 3 时才可成 5 张。
+    return: (score_tuple, best_five_cards)
+    """
+    if len(hole) < 2:
+        raise ValueError("hole_not_enough")
+    if len(board) < 3:
+        raise ValueError("board_not_enough")
+    best_score: Tuple[int, List[int]] = (-1, [])
+    best_five: List[Card] = []
+    for h2 in combinations(hole, 2):
+        for b3 in combinations(board, 3):
+            five = list(h2) + list(b3)
+            score = eval_5(five)
+            if score > best_score:
+                best_score = score
+                best_five = five
+    return best_score, best_five
+
+
 # ----------------------------
 # 游戏状态
 # ----------------------------
@@ -134,6 +235,8 @@ class Player:
     wss: Set[WebSocket] = field(default_factory=set, repr=False)
     hole: List[Card] = field(default_factory=list)
     chips_by_round: Dict[int, int] = field(default_factory=dict)  # round -> chip number
+    chip_marks_by_round: Dict[int, bool] = field(default_factory=dict)  # round -> marked
+    pending: bool = False  # 中途加入：本局观战，下一局进入
 
 
 @dataclass
@@ -144,6 +247,11 @@ class Room:
     started: bool = False
     # 牌局编号（同一房间可进行多局）。用于隔离日志，避免新一局仍下发旧局日志。
     hand_no: int = 0
+    # 本局参与的玩家 pid 集合（允许房间中存在“观战/待加入”的玩家）
+    hand_pids: Set[str] = field(default_factory=set)
+    # 游戏设置
+    hole_count: int = 2  # 2~6
+    rule: str = "holdem"  # holdem|omaha（omaha 强制用 2 张手牌 + 3 张公共牌）
     round_idx: int = 0  # 1..4
     stage: str = "lobby"  # lobby|preflop|flop|turn|river|showdown（兼容 drafting）
 
@@ -182,13 +290,35 @@ def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str,
     reveal_all = room.stage == "showdown"
     players = []
     for p in room.players.values():
+        # 未开局时，所有人默认都会参与（等待房主开始）
+        in_hand = (not room.started) or (p.pid in room.hand_pids)
+        hole_visible = reveal_all or viewer_pid == p.pid
+        hand_info: Optional[Dict[str, Any]] = None
+        # 翻牌圈及之后：仅对“该视角可见手牌”的玩家计算当前牌型
+        if room.started and in_hand and hole_visible and len(room.board) >= 3 and len(p.hole) >= 2:
+            try:
+                if room.rule == "omaha":
+                    score, five = best_hand_omaha(p.hole, room.board)
+                else:
+                    score, five = best_hand_any(p.hole + room.board)
+                hand_info = {
+                    "category": score[0],
+                    "categoryName": HAND_CATEGORY_NAME.get(score[0], str(score[0])),
+                    "five": [c.code() for c in five],
+                }
+            except Exception:
+                hand_info = None
         players.append(
             {
                 "pid": p.pid,
                 "nickname": p.nickname,
                 "isHost": p.pid == room.host_pid,
-                "hole": [c.code() for c in p.hole] if (reveal_all or viewer_pid == p.pid) else [],
+                "inHand": in_hand,
+                "pending": bool(p.pending),
+                "hole": [c.code() for c in p.hole] if hole_visible else [],
                 "chipsByRound": dict(p.chips_by_round),
+                "chipMarksByRound": dict(p.chip_marks_by_round),
+                "hand": hand_info,
                 "joinIndex": p.join_index,
             }
         )
@@ -204,6 +334,7 @@ def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str,
         "stage": room.stage,
         "stageName": STAGE_NAME_MAP.get(room.stage, room.stage),
         "round": room.round_idx,
+        "settings": {"holeCount": room.hole_count, "rule": room.rule, "handNo": room.hand_no},
         "board": [c.code() for c in room.board],
         "publicChips": sorted(list(room.public_chips)),
         "currentTurnPid": room.current_turn_pid,
@@ -273,12 +404,23 @@ def _n_players(room: Room) -> int:
     return len(room.players)
 
 
+def _hand_pids(room: Room) -> List[str]:
+    # 保证稳定顺序（按 joinIndex）
+    ps = [room.players[pid] for pid in room.hand_pids if pid in room.players]
+    ps.sort(key=lambda p: p.join_index)
+    return [p.pid for p in ps]
+
+
+def _n_hand_players(room: Room) -> int:
+    return len([pid for pid in room.hand_pids if pid in room.players])
+
+
 def _all_have_chip(room: Room, round_idx: int) -> bool:
-    return all(round_idx in p.chips_by_round for p in room.players.values())
+    return all(round_idx in room.players[pid].chips_by_round for pid in _hand_pids(room))
 
 
 def _unassigned_players(room: Room, round_idx: int) -> List[Player]:
-    return [p for p in room.players.values() if round_idx not in p.chips_by_round]
+    return [room.players[pid] for pid in _hand_pids(room) if round_idx not in room.players[pid].chips_by_round]
 
 
 def _first_round_rank(room: Room) -> Dict[str, int]:
@@ -317,9 +459,11 @@ def _deal_for_round(room: Room, round_idx: int) -> None:
     # round4: 河牌 1 张
     if round_idx == 1:
         room.board = []
-        for p in room.players.values():
-            p.hole = [room.deck.pop(), room.deck.pop()]
-        _room_log(room, "发底牌：每人两张（仅自己可见）", round_idx=1)
+        hc = min(6, max(2, int(room.hole_count)))
+        for pid in _hand_pids(room):
+            p = room.players[pid]
+            p.hole = [room.deck.pop() for _ in range(hc)]
+        _room_log(room, f"发底牌：每人{hc}张（仅自己可见）", round_idx=1)
     elif round_idx == 2:
         room.board.extend([room.deck.pop(), room.deck.pop(), room.deck.pop()])
         _room_log(room, f"翻牌：{' '.join([c.code() for c in room.board[-3:]])}", round_idx=2)
@@ -334,7 +478,7 @@ def _deal_for_round(room: Room, round_idx: int) -> None:
 def _start_round(room: Room, round_idx: int) -> None:
     room.round_idx = round_idx
     room.stage = {1: "preflop", 2: "flop", 3: "turn", 4: "river"}.get(round_idx, room.stage)
-    n = _n_players(room)
+    n = _n_hand_players(room)
     room.public_chips = set(range(1, n + 1))
     _room_log(room, f"第{round_idx}轮开始：生成公共筹码 1..{n}", round_idx=round_idx)
     _next_turn(room)
@@ -344,6 +488,10 @@ def _reset_for_new_game(room: Room) -> None:
     # 保留玩家与日志，重置牌局相关状态
     room.started = True
     room.hand_no += 1
+    # 下一局：把 pending 玩家纳入本局参与
+    room.hand_pids = set(room.players.keys())
+    for p in room.players.values():
+        p.pending = False
     room.stage = "preflop"
     room.round_idx = 0
     room.board = []
@@ -351,13 +499,15 @@ def _reset_for_new_game(room: Room) -> None:
     room.current_turn_pid = None
     room.first_round_order = []
 
-    for p in room.players.values():
+    for pid in list(room.players.keys()):
+        p = room.players[pid]
         p.hole = []
         p.chips_by_round = {}
+        p.chip_marks_by_round = {}
 
     room.deck = new_deck()
     secrets.SystemRandom().shuffle(room.deck)
-    pids = list(room.players.keys())
+    pids = _hand_pids(room)
     secrets.SystemRandom().shuffle(pids)
     room.first_round_order = pids
 
@@ -369,18 +519,36 @@ def _reset_for_new_game(room: Room) -> None:
 
 def _check_showdown_win(room: Room) -> Dict[str, Any]:
     """
-    按德州规则比较牌型大小，得到从大到小的名次。
+    比较牌型大小（支持 Hold'em / Omaha），得到从大到小的名次。
     要求：名次第k的玩家在第4轮持有的筹码数字 == (n-k+1) 才算排列正确。
     若出现同牌型（完全相等）则允许筹码不严格匹配（任意分配都算对）。
     """
-    n = _n_players(room)
-    # 计算每人最佳 7 张
-    scored: List[Tuple[Tuple[int, List[int]], str]] = []
-    for pid, p in room.players.items():
-        if len(p.hole) != 2 or len(room.board) != 5:
+    n = _n_hand_players(room)
+    hand_pids = _hand_pids(room)
+    hc = min(6, max(2, int(room.hole_count)))
+    if len(room.board) != 5 or n < 2:
+        return {"ok": False, "reason": "cards_not_complete"}
+
+    scored: List[Tuple[Tuple[int, List[int]], str, Dict[str, Any]]] = []
+    for pid in hand_pids:
+        p = room.players[pid]
+        if len(p.hole) != hc:
             return {"ok": False, "reason": "cards_not_complete"}
-        scored.append((eval_7(p.hole + room.board), pid))
-    scored.sort(reverse=True)  # best first
+        if room.rule == "omaha":
+            score, five = best_hand_omaha(p.hole, room.board)
+        else:
+            score, five = best_hand_any(p.hole + room.board)
+        detail = {
+            "pid": pid,
+            "nickname": p.nickname,
+            "score": score,
+            "category": score[0],
+            "categoryName": HAND_CATEGORY_NAME.get(score[0], str(score[0])),
+            "five": [c.code() for c in five],
+            "chipR4": p.chips_by_round.get(4),
+        }
+        scored.append((score, pid, detail))
+    scored.sort(key=lambda x: x[0], reverse=True)  # best first
 
     # 分组处理完全相等的手牌
     groups: List[List[str]] = []
@@ -389,7 +557,7 @@ def _check_showdown_win(room: Room) -> Dict[str, Any]:
         j = i + 1
         while j < len(scored) and scored[j][0] == scored[i][0]:
             j += 1
-        groups.append([pid for _, pid in scored[i:j]])
+        groups.append([pid for _, pid, _ in scored[i:j]])
         i = j
 
     # 需要匹配的目标筹码（第4轮）
@@ -405,11 +573,12 @@ def _check_showdown_win(room: Room) -> Dict[str, Any]:
                     "ok": False,
                     "reason": "chip_order_mismatch",
                     "detail": {"pid": pid, "need": need_chip, "have": have_chip},
+                    "showdown": {"ranking": [d for _, _, d in scored], "rule": room.rule, "holeCount": hc},
                 }
         # 同牌型组：不要求严格匹配
         pos += len(g)
 
-    return {"ok": True}
+    return {"ok": True, "showdown": {"ranking": [d for _, _, d in scored], "rule": room.rule, "holeCount": hc}}
 
 
 # ----------------------------
@@ -460,12 +629,27 @@ async def debug():
     }
 
 
+@app.get("/api/history")
+async def api_history(limit: int = 50, rid: Optional[str] = None):
+    """
+    返回最近的对局历史（尽可能多信息）。
+    注意：此接口会包含亮牌信息；适合自用/局域网部署。
+    """
+    limit = max(1, min(200, int(limit)))
+    async with HISTORY_LOCK:
+        items = HISTORY
+        if rid:
+            items = [x for x in items if x.get("rid") == rid]
+        return {"items": items[-limit:]}
+
+
 # ----------------------------
 # WebSocket 协议
 # ----------------------------
 # client -> server:
 # - {"type":"create_room","nickname":"xx"}
 # - {"type":"join_room","rid":"...","nickname":"xx"}
+# - {"type":"set_options","holeCount":2~6,"rule":"holdem"|"omaha"}  (仅房主；建议在未开始/亮牌后设置)
 # - {"type":"start_game"}
 # - {"type":"new_game"}
 # - {"type":"pick_chip","chip":number,"from":"public"|"player","fromPid":optional}
@@ -577,6 +761,7 @@ async def ws_endpoint(ws: WebSocket):
                 player = Player(pid=pid, nickname=nickname, join_index=room.join_counter)
                 player.wss.add(ws)
                 room.players[pid] = player
+                room.hand_pids.add(pid)
                 _room_log(room, f"创建房间：{nickname}（房主）进入房间", round_idx=0)
                 ROOMS[rid] = room
                 current_room = room
@@ -594,13 +779,15 @@ async def ws_endpoint(ws: WebSocket):
                     await ws.send_text(json.dumps({"type": "error", "message": "房间不存在"}, ensure_ascii=False))
                     continue
                 async with room.lock:
-                    if room.started:
-                        await ws.send_text(json.dumps({"type": "error", "message": "游戏已开始，暂不支持中途加入"}, ensure_ascii=False))
-                        continue
                     room.join_counter += 1
                     player = Player(pid=pid, nickname=nickname, join_index=room.join_counter)
                     player.wss.add(ws)
+                    # 若游戏已开始：允许加入房间，但本局作为观战/待加入，下一局开始时进入游戏
+                    if room.started:
+                        player.pending = True
                     room.players[pid] = player
+                    if not room.started:
+                        room.hand_pids.add(pid)
                     _room_log(room, f"玩家加入：{nickname} 进入房间", round_idx=0)
                     current_room = room
                     await room_broadcast_state(room)
@@ -622,10 +809,13 @@ async def ws_endpoint(ws: WebSocket):
                     room.started = True
                     # 第一次开局：从 1 开始计数
                     room.hand_no = max(room.hand_no, 0) + 1
+                    room.hand_pids = set(room.players.keys())
+                    for p in room.players.values():
+                        p.pending = False
                     room.stage = "preflop"
                     room.deck = new_deck()
                     secrets.SystemRandom().shuffle(room.deck)
-                    pids = list(room.players.keys())
+                    pids = _hand_pids(room)
                     secrets.SystemRandom().shuffle(pids)
                     room.first_round_order = pids
                     _room_log(room, f"房主开始游戏：玩家数={_n_players(room)}", round_idx=0)
@@ -633,6 +823,38 @@ async def ws_endpoint(ws: WebSocket):
                     # 第1轮发底牌并生成筹码
                     _deal_for_round(room, 1)
                     _start_round(room, 1)
+                    await room_broadcast_state(room)
+
+            elif mtype == "set_options":
+                if current_room is None:
+                    await ws.send_text(json.dumps({"type": "error", "message": "未加入房间"}, ensure_ascii=False))
+                    continue
+                room = current_room
+                async with room.lock:
+                    if pid != room.host_pid:
+                        await ws.send_text(json.dumps({"type": "error", "message": "只有房主可以修改设置"}, ensure_ascii=False))
+                        continue
+                    if room.started and _is_drafting_stage(room.stage):
+                        await ws.send_text(
+                            json.dumps({"type": "error", "message": "游戏进行中无法修改设置，请在等待中或亮牌后修改"}, ensure_ascii=False)
+                        )
+                        continue
+
+                    try:
+                        hole_count = int(msg.get("holeCount") or msg.get("hole_count") or msg.get("hole") or 2)
+                    except Exception:
+                        hole_count = 2
+                    hole_count = max(2, min(6, hole_count))
+
+                    rule_raw = (msg.get("rule") or "holdem")
+                    rule = str(rule_raw).strip().lower().replace("-", "_")
+                    if rule not in {"holdem", "omaha"}:
+                        await ws.send_text(json.dumps({"type": "error", "message": "rule 不合法（holdem/omaha）"}, ensure_ascii=False))
+                        continue
+
+                    room.hole_count = hole_count
+                    room.rule = rule
+                    _room_log(room, f"房主设置：手牌{hole_count}张，规则={rule}", round_idx=0)
                     await room_broadcast_state(room)
 
             elif mtype == "new_game":
@@ -664,6 +886,7 @@ async def ws_endpoint(ws: WebSocket):
                     leaver_wss = list(leaver.wss)
                     # 从房间移除
                     room.players.pop(pid, None)
+                    room.hand_pids.discard(pid)
                     _room_log(room, f"玩家退出：{leaver.nickname}", round_idx=0)
                     # 房主转移
                     if room.host_pid == pid and room.players:
@@ -700,10 +923,13 @@ async def ws_endpoint(ws: WebSocket):
                     if not _is_drafting_stage(room.stage):
                         await ws.send_text(json.dumps({"type": "error", "message": "当前不在选筹码阶段"}, ensure_ascii=False))
                         continue
+                    if pid not in room.hand_pids:
+                        await ws.send_text(json.dumps({"type": "error", "message": "你本局为观战/待加入，下一局开始后再参与"}, ensure_ascii=False))
+                        continue
                     if room.current_turn_pid != pid:
                         await ws.send_text(json.dumps({"type": "error", "message": "还没轮到你行动"}, ensure_ascii=False))
                         continue
-                    if chip < 1 or chip > _n_players(room):
+                    if chip < 1 or chip > _n_hand_players(room):
                         await ws.send_text(json.dumps({"type": "error", "message": "筹码数字不合法"}, ensure_ascii=False))
                         continue
                     me = room.players[pid]
@@ -725,6 +951,9 @@ async def ws_endpoint(ws: WebSocket):
                         if from_pid == pid:
                             await ws.send_text(json.dumps({"type": "error", "message": "不能从自己那里拿"}, ensure_ascii=False))
                             continue
+                        if from_pid not in room.hand_pids:
+                            await ws.send_text(json.dumps({"type": "error", "message": "目标玩家本局不参与"}, ensure_ascii=False))
+                            continue
                         other = room.players[from_pid]
                         if room.round_idx not in other.chips_by_round:
                             await ws.send_text(json.dumps({"type": "error", "message": "对方本轮还没有筹码，不能拿取"}, ensure_ascii=False))
@@ -736,6 +965,7 @@ async def ws_endpoint(ws: WebSocket):
                         # 根据描述“可以拿取其他玩家的筹码”：实现为“直接夺取”，对方本轮失去筹码，需之后再选；
                         # 夺取后公共区不变（筹码从对方面前转移到我面前）。
                         other.chips_by_round.pop(room.round_idx, None)
+                        other.chip_marks_by_round.pop(room.round_idx, None)
                         me.chips_by_round[room.round_idx] = chip
                         _room_log(
                             room,
@@ -745,6 +975,24 @@ async def ws_endpoint(ws: WebSocket):
                     else:
                         await ws.send_text(json.dumps({"type": "error", "message": "from 参数不合法"}, ensure_ascii=False))
                         continue
+
+                    # 记录筹码“超越标记”（第2轮及之后才有意义）
+                    if room.round_idx >= 2:
+                        prev = room.round_idx - 1
+                        my_prev = me.chips_by_round.get(prev)
+                        mark = False
+                        if my_prev is not None:
+                            for opid in _hand_pids(room):
+                                if opid == pid:
+                                    continue
+                                o_prev = room.players[opid].chips_by_round.get(prev)
+                                if o_prev is None:
+                                    continue
+                                # 上一轮曾“比我大”的玩家：o_prev > my_prev
+                                if o_prev > my_prev and chip > o_prev:
+                                    mark = True
+                                    break
+                        me.chip_marks_by_round[room.round_idx] = mark
 
                     # 推进回合
                     if _all_have_chip(room, room.round_idx):
@@ -757,6 +1005,48 @@ async def ws_endpoint(ws: WebSocket):
                                 _room_log(room, "游戏结束：排列正确，胜利！", round_idx=4)
                             else:
                                 _room_log(room, f"游戏结束：失败（{result.get('reason')}）", round_idx=4)
+
+                            # 落库历史记录（jsonl），尽可能多的信息
+                            try:
+                                ts = datetime.now(timezone.utc)
+                                hand_logs = [e for e in room.logs if e.get("handNo") == room.hand_no]
+                                ranking = (result.get("showdown") or {}).get("ranking") or []
+                                best_by_pid = {d.get("pid"): d for d in ranking if isinstance(d, dict)}
+                                players_record = []
+                                for hpid in _hand_pids(room):
+                                    pp = room.players[hpid]
+                                    players_record.append(
+                                        {
+                                            "pid": pp.pid,
+                                            "nickname": pp.nickname,
+                                            "joinIndex": pp.join_index,
+                                            "hole": [c.code() for c in pp.hole],
+                                            "chipsByRound": dict(pp.chips_by_round),
+                                            "chipMarksByRound": dict(pp.chip_marks_by_round),
+                                            "best": best_by_pid.get(pp.pid),
+                                        }
+                                    )
+                                spectators = [
+                                    {"pid": sp.pid, "nickname": sp.nickname, "joinIndex": sp.join_index}
+                                    for sp in room.players.values()
+                                    if sp.pid not in room.hand_pids
+                                ]
+                                record = {
+                                    "id": _id(8),
+                                    "ts": ts.timestamp(),
+                                    "iso": ts.isoformat(),
+                                    "rid": room.rid,
+                                    "handNo": room.hand_no,
+                                    "settings": {"holeCount": room.hole_count, "rule": room.rule},
+                                    "board": [c.code() for c in room.board],
+                                    "players": players_record,
+                                    "spectators": spectators,
+                                    "logs": hand_logs,
+                                    "result": result,
+                                }
+                                await append_history(record)
+                            except Exception:
+                                pass
                             await room_broadcast_state(room)
                             await room_broadcast(room, {"type": "game_over", "result": result})
                         else:
