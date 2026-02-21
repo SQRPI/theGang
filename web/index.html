@@ -369,6 +369,7 @@
       let state = null;
       let currentRid = null;
       let lastShowdownHandNo = null;
+      let lastGameOver = null;
 
       // 断线重连：指数退避
       let reconnectTimer = null;
@@ -433,7 +434,26 @@
       }
 
       function openSheet(title, rows) {
-        sheetTitleEl.textContent = title;
+        // title 支持字符串或 {round, chip}
+        sheetTitleEl.innerHTML = "";
+        if (typeof title === "string") {
+          sheetTitleEl.textContent = title;
+        } else if (title && typeof title === "object" && title.round && title.chip) {
+          const wrap = document.createElement("div");
+          wrap.className = "row";
+          wrap.style.gap = "10px";
+          const t = document.createElement("div");
+          t.textContent = `R${title.round}`;
+          const icon = chipCircleEl(title.chip, { small: true, round: Number(title.round) });
+          const tail = document.createElement("div");
+          tail.textContent = "流转";
+          wrap.appendChild(t);
+          wrap.appendChild(icon);
+          wrap.appendChild(tail);
+          sheetTitleEl.appendChild(wrap);
+        } else {
+          sheetTitleEl.textContent = "流转";
+        }
         sheetListEl.innerHTML = "";
         if (!rows.length) {
           const r = document.createElement("div");
@@ -471,7 +491,23 @@
           }
           return `#${e.seq}  ${e.text || ""}`;
         });
-        openSheet(`R${round} 筹码 #${chip} 流转`, rows);
+        openSheet({ round, chip }, rows);
+      }
+
+      function suitSym(s) {
+        return ({ s: "♠", h: "♥", d: "♦", c: "♣" }[s] || s);
+      }
+
+      function prettyCardCode(code) {
+        const r = code?.[0];
+        const s = code?.[1];
+        if (!r || !s) return code || "";
+        return String(r).toUpperCase() + suitSym(String(s).toLowerCase());
+      }
+
+      function prettyText(t) {
+        const s = String(t || "");
+        return s.replace(/\b([2-9TJQKA])([shdc])\b/g, (_, r, su) => (String(r).toUpperCase() + suitSym(String(su).toLowerCase())));
       }
 
       function openShowdown() {
@@ -482,26 +518,32 @@
         lastShowdownHandNo = handNo;
 
         const players = (state?.players || []).slice();
-        players.sort((a,b) => {
+        const n = players.length;
+        const chipSorted = players.slice().sort((a,b) => {
           const ca = Number((a.chipsByRound||{})["4"] ?? (a.chipsByRound||{})[4] ?? 9999);
           const cb = Number((b.chipsByRound||{})["4"] ?? (b.chipsByRound||{})[4] ?? 9999);
           return ca - cb;
         });
+        const bestRanking = (lastGameOver?.showdown?.ranking || []).slice(); // best first
+        const handRankByPid = new Map(bestRanking.map((d, i) => [d.pid, i + 1]));
 
         showdownSubEl.textContent = `规则=${settings.rule || "-"}  手牌=${settings.holeCount || "-"}  房间=${state?.rid || "-"}`;
         showdownListEl.innerHTML = "";
-        for (const p of players) {
+        for (const p of chipSorted) {
           const r4 = (p.chipsByRound || {})["4"] ?? (p.chipsByRound || {})[4];
           const box = document.createElement("div");
           box.className = "rankRow";
           const top = document.createElement("div");
           top.className = "rankTop";
           const left = document.createElement("div");
-          left.innerHTML = `<div class="rankName">${p.nickname || p.pid}</div><div class="muted">筹码（R4）：${r4 ?? "-"}</div>`;
+          const hr = handRankByPid.get(p.pid);
+          const needChip = (typeof hr === "number") ? (n - hr + 1) : null;
+          left.innerHTML = `<div class="rankName">${p.nickname || p.pid}</div><div class="muted">牌力排名：${hr ? ("#" + hr + "/" + n) : "（未知）"}  ·  筹码R4：${r4 ?? "-"}` + (needChip ? `（应为 ${needChip}）` : "") + `</div>`;
           const right = document.createElement("div");
           const tag = document.createElement("div");
           tag.className = "pill";
-          tag.textContent = p.hand?.categoryName || "（未知牌型）";
+          const desc = p.hand?.desc ? (" " + p.hand.desc) : "";
+          tag.textContent = (p.hand?.categoryName || "（未知牌型）") + desc;
           right.appendChild(tag);
           top.appendChild(left);
           top.appendChild(right);
@@ -514,7 +556,7 @@
 
           const sub = document.createElement("div");
           sub.className = "rankSub";
-          sub.textContent = `最佳5张：${(p.hand?.five || []).join(" ")}`;
+          sub.textContent = `最佳5张：${(p.hand?.five || []).map(prettyCardCode).join(" ")}`;
           box.appendChild(sub);
 
           showdownListEl.appendChild(box);
@@ -622,6 +664,20 @@
           top.appendChild(right);
           card.appendChild(top);
 
+          // 房主踢人（仅未开始）
+          if (isHost && !state.started && p.pid !== myPid && !p.isHost) {
+            const kick = document.createElement("button");
+            kick.className = "ghost";
+            kick.style.height = "36px";
+            kick.style.padding = "0 10px";
+            kick.textContent = "踢";
+            kick.onclick = () => {
+              send({ type: "kick_player", targetPid: p.pid });
+              logLocal("已发送：踢人 " + (p.nickname || p.pid));
+            };
+            right.appendChild(kick);
+          }
+
           // 筹码（只显示“名字+筹码”为主；手牌仅在本人/观战/结算时显示）
           const chips = p.chipsByRound || {};
           const marks = p.chipMarksByRound || {};
@@ -689,7 +745,7 @@
             if (p.hand?.categoryName) {
               const tag = document.createElement("div");
               tag.className = "pill ok";
-              tag.textContent = p.hand.categoryName;
+              tag.textContent = p.hand.categoryName + (p.hand.desc ? (" " + p.hand.desc) : "");
               card.appendChild(tag);
             }
           }
@@ -704,7 +760,7 @@
           const it = document.createElement("div");
           it.className = "logItem";
           const r = (e.round === 0 || e.round == null) ? "" : `R${e.round} `;
-          it.textContent = `• ${r}${e.text || ""}`;
+          it.textContent = `• ${r}${prettyText(e.text || "")}`;
           logEl.appendChild(it);
         }
         logEl.scrollTop = logEl.scrollHeight;
@@ -732,7 +788,7 @@
             box.className = "sheetRow";
             const ok = rec?.result?.ok;
             const s = `${rec.iso || ""}  局#${rec.handNo ?? "-"}  ${ok ? "胜利" : "失败"}  规则=${rec?.settings?.rule || "-"}  手牌=${rec?.settings?.holeCount || "-"}`;
-            box.textContent = s;
+            box.textContent = prettyText(s);
             historyEl.appendChild(box);
           }
         } catch (e) {
@@ -817,7 +873,10 @@
           } else if (msg.type === "error") {
             logLocal("错误：" + msg.message);
           } else if (msg.type === "game_over") {
+            lastGameOver = msg.result || null;
             logLocal(msg.result?.ok ? "游戏结束：胜利" : "游戏结束：失败");
+            // 立即打开结算
+            openShowdown();
           } else {
             logLocal("未知消息：" + ev.data);
           }

@@ -19,9 +19,11 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIR = BASE_DIR / "web"
 DATA_DIR = BASE_DIR / "data"
 HISTORY_FILE = DATA_DIR / "history.jsonl"
+ROOMS_FILE = DATA_DIR / "rooms.json"
 HISTORY_MAX = 5000
 HISTORY: List[Dict[str, Any]] = []
 HISTORY_LOCK = asyncio.Lock()
+ROOMS_LOCK = asyncio.Lock()
 
 
 def _load_history() -> None:
@@ -84,6 +86,25 @@ class Card:
 
     def code(self) -> str:
         return f"{self.rank}{self.suit}"
+
+
+def _card_from_code(code: str) -> Card:
+    code = (code or "").strip()
+    if len(code) < 2:
+        raise ValueError("bad_card_code")
+    r = code[0].upper()
+    s = code[1].lower()
+    if r not in RANKS or s not in SUITS:
+        raise ValueError("bad_card_code")
+    return Card(r, s)
+
+
+def _cards_from_codes(codes: List[str]) -> List[Card]:
+    return [_card_from_code(c) for c in (codes or [])]
+
+
+def _cards_to_codes(cards: List[Card]) -> List[str]:
+    return [c.code() for c in (cards or [])]
 
 
 def new_deck() -> List[Card]:
@@ -178,6 +199,33 @@ HAND_CATEGORY_NAME = {
     1: "一对",
     0: "高牌",
 }
+
+RANK_LABEL = {i + 2: r for i, r in enumerate(RANKS)}  # 2..14 -> "2".."A"
+
+
+def _hand_desc(category: int, tiebreak: List[int]) -> str:
+    """
+    返回类似：
+    - 三条：A-5-2
+    - 葫芦：7-3
+    - 两对：K-T-2
+    """
+    xs = [RANK_LABEL.get(int(v), str(v)) for v in (tiebreak or [])]
+    if category in (8, 4):  # 同花顺/顺子：只需最高张
+        return xs[0] if xs else ""
+    if category == 7:  # 四条：四条-踢脚
+        return "-".join(xs[:2])
+    if category == 6:  # 葫芦：三条-对子
+        return "-".join(xs[:2])
+    if category in (5, 0):  # 同花/高牌：五张从大到小
+        return "-".join(xs[:5])
+    if category == 3:  # 三条：三条-两踢脚
+        return "-".join(xs[:3])
+    if category == 2:  # 两对：高对-低对-踢脚
+        return "-".join(xs[:3])
+    if category == 1:  # 一对：对子-三踢脚
+        return "-".join(xs[:4])
+    return "-".join(xs)
 
 
 def best_hand_any(cards: List[Card]) -> Tuple[Tuple[int, List[int]], List[Card]]:
@@ -274,6 +322,119 @@ class Room:
 ROOMS: Dict[str, Room] = {}
 
 
+def _load_rooms() -> None:
+    try:
+        if not ROOMS_FILE.exists():
+            return
+        data = json.loads(ROOMS_FILE.read_text(encoding="utf-8") or "{}")
+        rooms = data.get("rooms") if isinstance(data, dict) else None
+        if not isinstance(rooms, list):
+            return
+        for rd in rooms:
+            if not isinstance(rd, dict):
+                continue
+            rid = str(rd.get("rid") or "").strip()
+            host_pid = str(rd.get("hostPid") or "").strip()
+            if not rid or not host_pid:
+                continue
+            room = Room(rid=rid, host_pid=host_pid)
+            room.started = bool(rd.get("started"))
+            room.hand_no = int(rd.get("handNo") or 0)
+            room.hand_pids = set(rd.get("handPids") or [])
+            room.hole_count = int(rd.get("holeCount") or 2)
+            room.rule = str(rd.get("rule") or "holdem")
+            room.fast_pick = bool(rd.get("fastPick"))
+            room.round_idx = int(rd.get("round") or 0)
+            room.stage = str(rd.get("stage") or "lobby")
+            room.deck = _cards_from_codes(rd.get("deck") or [])
+            room.board = _cards_from_codes(rd.get("board") or [])
+            room.public_chips = set(int(x) for x in (rd.get("publicChips") or []) if isinstance(x, int) or str(x).isdigit())
+            room.current_turn_pid = rd.get("currentTurnPid")
+            room.first_round_order = list(rd.get("firstRoundOrder") or [])
+            room.join_counter = int(rd.get("joinCounter") or 0)
+            room.logs = list(rd.get("logs") or [])
+            room.log_seq = int(rd.get("logSeq") or 0)
+
+            players = rd.get("players") or []
+            if isinstance(players, list):
+                for pd in players:
+                    if not isinstance(pd, dict):
+                        continue
+                    pid = str(pd.get("pid") or "").strip()
+                    nickname = str(pd.get("nickname") or "").strip()
+                    if not pid or not nickname:
+                        continue
+                    p = Player(pid=pid, nickname=nickname, join_index=int(pd.get("joinIndex") or 0))
+                    p.hole = _cards_from_codes(pd.get("hole") or [])
+                    cbd = pd.get("chipsByRound") or {}
+                    if isinstance(cbd, dict):
+                        p.chips_by_round = {int(k): int(v) for k, v in cbd.items()}
+                    md = pd.get("chipMarksByRound") or {}
+                    if isinstance(md, dict):
+                        p.chip_marks_by_round = {int(k): bool(v) for k, v in md.items()}
+                    p.pending = bool(pd.get("pending"))
+                    p.spectator = bool(pd.get("spectator"))
+                    room.players[p.pid] = p
+
+            room.hand_pids = {pid for pid in room.hand_pids if pid in room.players and not room.players[pid].spectator}
+            ROOMS[room.rid] = room
+    except Exception:
+        return
+
+
+def _serialize_room(room: Room) -> Dict[str, Any]:
+    return {
+        "rid": room.rid,
+        "hostPid": room.host_pid,
+        "started": room.started,
+        "handNo": room.hand_no,
+        "handPids": sorted(list(room.hand_pids)),
+        "holeCount": room.hole_count,
+        "rule": room.rule,
+        "fastPick": room.fast_pick,
+        "round": room.round_idx,
+        "stage": room.stage,
+        "deck": _cards_to_codes(room.deck),
+        "board": _cards_to_codes(room.board),
+        "publicChips": sorted(list(room.public_chips)),
+        "currentTurnPid": room.current_turn_pid,
+        "firstRoundOrder": list(room.first_round_order),
+        "joinCounter": room.join_counter,
+        "logs": room.logs,
+        "logSeq": room.log_seq,
+        "players": [
+            {
+                "pid": p.pid,
+                "nickname": p.nickname,
+                "joinIndex": p.join_index,
+                "hole": _cards_to_codes(p.hole),
+                "chipsByRound": dict(p.chips_by_round),
+                "chipMarksByRound": dict(p.chip_marks_by_round),
+                "pending": p.pending,
+                "spectator": p.spectator,
+            }
+            for p in room.players.values()
+        ],
+    }
+
+
+def _write_rooms_snapshot(snapshot: Dict[str, Any]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ROOMS_FILE.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+
+
+async def persist_rooms() -> None:
+    async with ROOMS_LOCK:
+        snapshot = {"rooms": [_serialize_room(r) for r in ROOMS.values()]}
+    try:
+        await asyncio.to_thread(_write_rooms_snapshot, snapshot)
+    except Exception:
+        pass
+
+
+_load_rooms()
+
+
 # 阶段中文名（前后端共用）
 STAGE_NAME_MAP = {
     "lobby": "等待中",
@@ -307,6 +468,7 @@ def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str,
                 hand_info = {
                     "category": score[0],
                     "categoryName": HAND_CATEGORY_NAME.get(score[0], str(score[0])),
+                    "desc": _hand_desc(score[0], score[1]),
                     "five": [c.code() for c in five],
                 }
             except Exception:
@@ -576,6 +738,7 @@ def _check_showdown_win(room: Room) -> Dict[str, Any]:
             "score": score,
             "category": score[0],
             "categoryName": HAND_CATEGORY_NAME.get(score[0], str(score[0])),
+            "desc": _hand_desc(score[0], score[1]),
             "five": [c.code() for c in five],
             "chipR4": p.chips_by_round.get(4),
         }
@@ -685,6 +848,7 @@ async def api_history(limit: int = 50, rid: Optional[str] = None):
 # - {"type":"start_game"}
 # - {"type":"new_game"}
 # - {"type":"pick_chip","chip":number,"from":"public"|"player","fromPid":optional}
+# - {"type":"kick_player","targetPid":"..."}  (仅房主；仅未开始时)
 #
 # server -> client:
 # - {"type":"hello","pid":...}
@@ -798,6 +962,7 @@ async def ws_endpoint(ws: WebSocket):
                 ROOMS[rid] = room
                 current_room = room
                 await room_broadcast_state(room)
+                await persist_rooms()
 
             elif mtype == "join_room":
                 rid = (msg.get("rid") or "").strip()
@@ -811,6 +976,19 @@ async def ws_endpoint(ws: WebSocket):
                     await ws.send_text(json.dumps({"type": "error", "message": "房间不存在"}, ensure_ascii=False))
                     continue
                 async with room.lock:
+                    # 禁止同房间出现两个“不同 pid 但相同昵称”的玩家：若昵称已存在则视为重连
+                    norm_nick = nickname.strip().lower()
+                    existing = next((p for p in room.players.values() if p.nickname.strip().lower() == norm_nick), None)
+                    if existing is not None and existing.pid != pid:
+                        existing.wss.add(ws)
+                        current_room = room
+                        pid = existing.pid
+                        _room_log(room, f"玩家重连（按昵称）：{existing.nickname}", round_idx=0)
+                        await ws.send_text(json.dumps({"type": "hello", "pid": pid, "resumed": True, "rebind": True}, ensure_ascii=False))
+                        await room_broadcast_state(room)
+                        await persist_rooms()
+                        continue
+
                     room.join_counter += 1
                     player = Player(pid=pid, nickname=nickname, join_index=room.join_counter)
                     player.wss.add(ws)
@@ -826,6 +1004,7 @@ async def ws_endpoint(ws: WebSocket):
                     _room_log(room, f"玩家加入：{nickname} 进入房间", round_idx=0)
                     current_room = room
                     await room_broadcast_state(room)
+                    await persist_rooms()
 
             elif mtype == "start_game":
                 if current_room is None:
@@ -860,6 +1039,7 @@ async def ws_endpoint(ws: WebSocket):
                     _deal_for_round(room, 1)
                     _start_round(room, 1)
                     await room_broadcast_state(room)
+                    await persist_rooms()
 
             elif mtype == "set_options":
                 if current_room is None:
@@ -895,6 +1075,7 @@ async def ws_endpoint(ws: WebSocket):
                     room.fast_pick = fast_pick
                     _room_log(room, f"房主设置：手牌{hole_count}张，规则={rule}，实时筹码={'开' if fast_pick else '关'}", round_idx=0)
                     await room_broadcast_state(room)
+                    await persist_rooms()
 
             elif mtype == "new_game":
                 if current_room is None:
@@ -911,6 +1092,38 @@ async def ws_endpoint(ws: WebSocket):
                     # 允许在结束后或中途直接重开（方便调试）
                     _reset_for_new_game(room)
                     await room_broadcast_state(room)
+                    await persist_rooms()
+
+            elif mtype == "kick_player":
+                if current_room is None:
+                    await ws.send_text(json.dumps({"type": "error", "message": "未加入房间"}, ensure_ascii=False))
+                    continue
+                room = current_room
+                target_pid = (msg.get("targetPid") or msg.get("pid") or "").strip()
+                async with room.lock:
+                    if pid != room.host_pid:
+                        await ws.send_text(json.dumps({"type": "error", "message": "只有房主可以踢人"}, ensure_ascii=False))
+                        continue
+                    if room.started:
+                        await ws.send_text(json.dumps({"type": "error", "message": "对局开始后不能踢人"}, ensure_ascii=False))
+                        continue
+                    if not target_pid or target_pid not in room.players:
+                        await ws.send_text(json.dumps({"type": "error", "message": "目标玩家不存在"}, ensure_ascii=False))
+                        continue
+                    if target_pid == room.host_pid:
+                        await ws.send_text(json.dumps({"type": "error", "message": "不能踢房主"}, ensure_ascii=False))
+                        continue
+                    kicked = room.players.pop(target_pid)
+                    room.hand_pids.discard(target_pid)
+                    _room_log(room, f"房主踢出：{kicked.nickname}", round_idx=0)
+                    # 通知被踢者所有连接
+                    for w in list(kicked.wss):
+                        try:
+                            await w.send_text(json.dumps({"type": "left_room", "rid": room.rid, "message": "你已被房主踢出房间"}, ensure_ascii=False))
+                        except Exception:
+                            pass
+                    await room_broadcast_state(room)
+                    await persist_rooms()
 
             elif mtype == "leave_room":
                 if current_room is None:
@@ -940,6 +1153,7 @@ async def ws_endpoint(ws: WebSocket):
                         # 若游戏中，可能影响筹码与回合：直接重算当前行动者
                         _next_turn(room)
                         await room_broadcast_state(room)
+                await persist_rooms()
 
                 # 同 pid 可能有多个页面：都通知“已退出房间”，让前端同步清空 UI
                 for w in leaver_wss:
@@ -1104,15 +1318,18 @@ async def ws_endpoint(ws: WebSocket):
                                 pass
                             await room_broadcast_state(room)
                             await room_broadcast(room, {"type": "game_over", "result": result})
+                            await persist_rooms()
                         else:
                             # 下一轮：先翻牌/转牌/河牌，再生成筹码
                             _deal_for_round(room, room.round_idx + 1)
                             _start_round(room, room.round_idx + 1)
                             await room_broadcast_state(room)
+                            await persist_rooms()
                     else:
                         if not room.fast_pick:
                             _next_turn(room)
                         await room_broadcast_state(room)
+                        await persist_rooms()
 
             else:
                 # 把未知消息写到房间日志，便于排查“下一局触发未知消息类型”
