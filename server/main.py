@@ -237,6 +237,7 @@ class Player:
     chips_by_round: Dict[int, int] = field(default_factory=dict)  # round -> chip number
     chip_marks_by_round: Dict[int, bool] = field(default_factory=dict)  # round -> marked
     pending: bool = False  # 中途加入：本局观战，下一局进入
+    spectator: bool = False  # 观战：不参与游戏，但可看所有人手牌
 
 
 @dataclass
@@ -252,6 +253,7 @@ class Room:
     # 游戏设置
     hole_count: int = 2  # 2~6
     rule: str = "holdem"  # holdem|omaha（omaha 强制用 2 张手牌 + 3 张公共牌）
+    fast_pick: bool = False  # 实时筹码：本轮拿筹码不按顺序
     round_idx: int = 0  # 1..4
     stage: str = "lobby"  # lobby|preflop|flop|turn|river|showdown（兼容 drafting）
 
@@ -288,11 +290,12 @@ STAGE_NAME_MAP = {
 def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str, Any]:
     # 注意：亮牌阶段公开所有人的底牌；其他阶段只向本人展示自己的底牌
     reveal_all = room.stage == "showdown"
+    viewer_is_spectator = bool(viewer_pid and viewer_pid in room.players and room.players[viewer_pid].spectator)
     players = []
     for p in room.players.values():
         # 未开局时，所有人默认都会参与（等待房主开始）
         in_hand = (not room.started) or (p.pid in room.hand_pids)
-        hole_visible = reveal_all or viewer_pid == p.pid
+        hole_visible = reveal_all or viewer_is_spectator or viewer_pid == p.pid
         hand_info: Optional[Dict[str, Any]] = None
         # 翻牌圈及之后：仅对“该视角可见手牌”的玩家计算当前牌型
         if room.started and in_hand and hole_visible and len(room.board) >= 3 and len(p.hole) >= 2:
@@ -315,6 +318,7 @@ def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str,
                 "isHost": p.pid == room.host_pid,
                 "inHand": in_hand,
                 "pending": bool(p.pending),
+                "spectator": bool(p.spectator),
                 "hole": [c.code() for c in p.hole] if hole_visible else [],
                 "chipsByRound": dict(p.chips_by_round),
                 "chipMarksByRound": dict(p.chip_marks_by_round),
@@ -334,7 +338,12 @@ def room_public_state(room: Room, viewer_pid: Optional[str] = None) -> Dict[str,
         "stage": room.stage,
         "stageName": STAGE_NAME_MAP.get(room.stage, room.stage),
         "round": room.round_idx,
-        "settings": {"holeCount": room.hole_count, "rule": room.rule, "handNo": room.hand_no},
+        "settings": {
+            "holeCount": room.hole_count,
+            "rule": room.rule,
+            "handNo": room.hand_no,
+            "fastPick": room.fast_pick,
+        },
         "board": [c.code() for c in room.board],
         "publicChips": sorted(list(room.public_chips)),
         "currentTurnPid": room.current_turn_pid,
@@ -360,6 +369,25 @@ def _room_log(room: Room, text: str, round_idx: Optional[int] = None) -> None:
             "text": text,
         }
     )
+
+
+def _room_event(room: Room, text: str, round_idx: Optional[int] = None, **extra: Any) -> None:
+    """
+    结构化事件日志：用于前端按“某轮/某筹码”回放。
+    extra 示例：
+      event="chip_take"/"chip_steal", chip=3, actorPid="..", from="public"/"player", fromPid=".."
+    """
+    room.log_seq += 1
+    e: Dict[str, Any] = {
+        "seq": room.log_seq,
+        "handNo": room.hand_no,
+        "round": round_idx if round_idx is not None else room.round_idx,
+        "stage": room.stage,
+        "stageName": STAGE_NAME_MAP.get(room.stage, room.stage),
+        "text": text,
+    }
+    e.update(extra)
+    room.logs.append(e)
 
 
 async def room_broadcast(room: Room, msg: Dict[str, Any]) -> None:
@@ -481,7 +509,10 @@ def _start_round(room: Room, round_idx: int) -> None:
     n = _n_hand_players(room)
     room.public_chips = set(range(1, n + 1))
     _room_log(room, f"第{round_idx}轮开始：生成公共筹码 1..{n}", round_idx=round_idx)
-    _next_turn(room)
+    if room.fast_pick:
+        room.current_turn_pid = None
+    else:
+        _next_turn(room)
 
 
 def _reset_for_new_game(room: Room) -> None:
@@ -489,9 +520,10 @@ def _reset_for_new_game(room: Room) -> None:
     room.started = True
     room.hand_no += 1
     # 下一局：把 pending 玩家纳入本局参与
-    room.hand_pids = set(room.players.keys())
+    room.hand_pids = {pid for pid, p in room.players.items() if not p.spectator}
     for p in room.players.values():
-        p.pending = False
+        if not p.spectator:
+            p.pending = False
     room.stage = "preflop"
     room.round_idx = 0
     room.board = []
@@ -512,7 +544,7 @@ def _reset_for_new_game(room: Room) -> None:
     room.first_round_order = pids
 
     _room_log(room, "—— 新一局开始 ——", round_idx=0)
-    _room_log(room, f"玩家数={_n_players(room)}", round_idx=0)
+    _room_log(room, f"玩家数={_n_hand_players(room)}", round_idx=0)
     _deal_for_round(room, 1)
     _start_round(room, 1)
 
@@ -782,11 +814,14 @@ async def ws_endpoint(ws: WebSocket):
                     room.join_counter += 1
                     player = Player(pid=pid, nickname=nickname, join_index=room.join_counter)
                     player.wss.add(ws)
+                    spectate = bool(msg.get("spectate") or msg.get("spectator") or (str(msg.get("mode") or "").strip().lower() == "spectate"))
+                    if spectate:
+                        player.spectator = True
                     # 若游戏已开始：允许加入房间，但本局作为观战/待加入，下一局开始时进入游戏
-                    if room.started:
+                    if room.started and not player.spectator:
                         player.pending = True
                     room.players[pid] = player
-                    if not room.started:
+                    if not room.started and not player.spectator:
                         room.hand_pids.add(pid)
                     _room_log(room, f"玩家加入：{nickname} 进入房间", round_idx=0)
                     current_room = room
@@ -809,16 +844,17 @@ async def ws_endpoint(ws: WebSocket):
                     room.started = True
                     # 第一次开局：从 1 开始计数
                     room.hand_no = max(room.hand_no, 0) + 1
-                    room.hand_pids = set(room.players.keys())
+                    room.hand_pids = {pid for pid, p in room.players.items() if not p.spectator}
                     for p in room.players.values():
-                        p.pending = False
+                        if not p.spectator:
+                            p.pending = False
                     room.stage = "preflop"
                     room.deck = new_deck()
                     secrets.SystemRandom().shuffle(room.deck)
                     pids = _hand_pids(room)
                     secrets.SystemRandom().shuffle(pids)
                     room.first_round_order = pids
-                    _room_log(room, f"房主开始游戏：玩家数={_n_players(room)}", round_idx=0)
+                    _room_log(room, f"房主开始游戏：玩家数={_n_hand_players(room)}", round_idx=0)
 
                     # 第1轮发底牌并生成筹码
                     _deal_for_round(room, 1)
@@ -852,9 +888,12 @@ async def ws_endpoint(ws: WebSocket):
                         await ws.send_text(json.dumps({"type": "error", "message": "rule 不合法（holdem/omaha）"}, ensure_ascii=False))
                         continue
 
+                    fast_pick = bool(msg.get("fastPick") or msg.get("fast_pick") or msg.get("fastpick"))
+
                     room.hole_count = hole_count
                     room.rule = rule
-                    _room_log(room, f"房主设置：手牌{hole_count}张，规则={rule}", round_idx=0)
+                    room.fast_pick = fast_pick
+                    _room_log(room, f"房主设置：手牌{hole_count}张，规则={rule}，实时筹码={'开' if fast_pick else '关'}", round_idx=0)
                     await room_broadcast_state(room)
 
             elif mtype == "new_game":
@@ -926,7 +965,7 @@ async def ws_endpoint(ws: WebSocket):
                     if pid not in room.hand_pids:
                         await ws.send_text(json.dumps({"type": "error", "message": "你本局为观战/待加入，下一局开始后再参与"}, ensure_ascii=False))
                         continue
-                    if room.current_turn_pid != pid:
+                    if (not room.fast_pick) and room.current_turn_pid != pid:
                         await ws.send_text(json.dumps({"type": "error", "message": "还没轮到你行动"}, ensure_ascii=False))
                         continue
                     if chip < 1 or chip > _n_hand_players(room):
@@ -943,7 +982,16 @@ async def ws_endpoint(ws: WebSocket):
                             continue
                         room.public_chips.remove(chip)
                         me.chips_by_round[room.round_idx] = chip
-                        _room_log(room, f"第{room.round_idx}轮：{me.nickname} 从公共区拿取筹码 #{chip}", round_idx=room.round_idx)
+                        _room_event(
+                            room,
+                            f"第{room.round_idx}轮：{me.nickname} 从公共区拿取筹码 #{chip}",
+                            round_idx=room.round_idx,
+                            event="chip_take",
+                            chip=chip,
+                            actorPid=me.pid,
+                            actor=me.nickname,
+                            frm="public",
+                        )
                     elif from_where == "player":
                         if not from_pid or from_pid not in room.players:
                             await ws.send_text(json.dumps({"type": "error", "message": "目标玩家不存在"}, ensure_ascii=False))
@@ -967,10 +1015,17 @@ async def ws_endpoint(ws: WebSocket):
                         other.chips_by_round.pop(room.round_idx, None)
                         other.chip_marks_by_round.pop(room.round_idx, None)
                         me.chips_by_round[room.round_idx] = chip
-                        _room_log(
+                        _room_event(
                             room,
                             f"第{room.round_idx}轮：{me.nickname} 夺取 {other.nickname} 的筹码 #{chip}（{other.nickname} 本轮需重新拿取）",
                             round_idx=room.round_idx,
+                            event="chip_steal",
+                            chip=chip,
+                            actorPid=me.pid,
+                            actor=me.nickname,
+                            frm="player",
+                            fromPid=other.pid,
+                            fromPlayer=other.nickname,
                         )
                     else:
                         await ws.send_text(json.dumps({"type": "error", "message": "from 参数不合法"}, ensure_ascii=False))
@@ -1055,7 +1110,8 @@ async def ws_endpoint(ws: WebSocket):
                             _start_round(room, room.round_idx + 1)
                             await room_broadcast_state(room)
                     else:
-                        _next_turn(room)
+                        if not room.fast_pick:
+                            _next_turn(room)
                         await room_broadcast_state(room)
 
             else:
