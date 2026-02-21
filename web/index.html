@@ -23,7 +23,8 @@
         color: var(--text);
         -webkit-tap-highlight-color: transparent;
       }
-      .app { max-width: 1100px; margin: 0 auto; padding: 12px; }
+      /* 大屏时放宽主体宽度，让一行能容纳更多玩家卡片 */
+      .app { max-width: 1800px; margin: 0 auto; padding: 12px; }
       .topbar {
         position: sticky; top: 0; z-index: 5;
         background: rgba(246,247,251,.86);
@@ -126,11 +127,9 @@
 
       .playersGrid {
         display:grid;
-        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        /* 跟随可用宽度自动增减列数：大屏更多列，小屏更大触控区 */
+        grid-template-columns: repeat(auto-fit, minmax(clamp(150px, 15vw, 240px), 1fr));
         gap: 10px;
-      }
-      @media (min-width: 720px) {
-        .playersGrid { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
       }
       .playerCard {
         border:1px solid #eceef6;

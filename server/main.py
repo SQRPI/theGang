@@ -1189,6 +1189,8 @@ async def ws_endpoint(ws: WebSocket):
                     if room.round_idx in me.chips_by_round:
                         await ws.send_text(json.dumps({"type": "error", "message": "你本轮已经拿过筹码"}, ensure_ascii=False))
                         continue
+                    # 用于“小橙点”规则：轮流模式下，记录本次拿取前公共区最小筹码
+                    min_public_before = min(room.public_chips) if room.public_chips else None
 
                     if from_where == "public":
                         if chip not in room.public_chips:
@@ -1227,7 +1229,6 @@ async def ws_endpoint(ws: WebSocket):
                         # 根据描述“可以拿取其他玩家的筹码”：实现为“直接夺取”，对方本轮失去筹码，需之后再选；
                         # 夺取后公共区不变（筹码从对方面前转移到我面前）。
                         other.chips_by_round.pop(room.round_idx, None)
-                        other.chip_marks_by_round.pop(room.round_idx, None)
                         me.chips_by_round[room.round_idx] = chip
                         _room_event(
                             room,
@@ -1245,23 +1246,14 @@ async def ws_endpoint(ws: WebSocket):
                         await ws.send_text(json.dumps({"type": "error", "message": "from 参数不合法"}, ensure_ascii=False))
                         continue
 
-                    # 记录筹码“超越标记”（第2轮及之后才有意义）
-                    if room.round_idx >= 2:
-                        prev = room.round_idx - 1
-                        my_prev = me.chips_by_round.get(prev)
-                        mark = False
-                        if my_prev is not None:
-                            for opid in _hand_pids(room):
-                                if opid == pid:
-                                    continue
-                                o_prev = room.players[opid].chips_by_round.get(prev)
-                                if o_prev is None:
-                                    continue
-                                # 上一轮曾“比我大”的玩家：o_prev > my_prev
-                                if o_prev > my_prev and chip > o_prev:
-                                    mark = True
-                                    break
-                        me.chip_marks_by_round[room.round_idx] = mark
+                    # 记录“小橙点”：
+                    # - 仅轮流行动模式（fast_pick=False）
+                    # - 当轮第一次拿取时，若 chip <= 拿取前公共区最小筹码，则标记为 True
+                    # - 一旦标记为 True，本轮后续即使换筹码也保留
+                    if not room.fast_pick:
+                        if room.round_idx not in me.chip_marks_by_round:
+                            hit_min_try = bool(min_public_before is not None and chip <= int(min_public_before))
+                            me.chip_marks_by_round[room.round_idx] = hit_min_try
 
                     # 推进回合
                     if _all_have_chip(room, room.round_idx):
